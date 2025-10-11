@@ -27,7 +27,7 @@ Manifest*.toml
 LocalPreferences.toml
 JuliaLocalPreferences.toml
 
-
+.vscode
 *.jld2
 *.pdf
 *.jpg
