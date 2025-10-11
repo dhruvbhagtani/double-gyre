@@ -1,19 +1,15 @@
 # # Double Gyre
-#
-# This example simulates a double gyre following:
-# https://mitgcm.readthedocs.io/en/latest/examples/baroclinic_gyre/baroclinic_gyre.html
 
 using Oceananigans
 using Oceananigans.Units
-# using Oceananigans.TurbulenceClosures: VerticallyImplicitTimeDiscretization
-# using Oceananigans.Coriolis: ActiveCellEnstrophyConservingScheme
-# using Oceananigans.Operators
 
 using CairoMakie
 using Statistics
 using Printf
 
-arch = CPU() # or GPU()
+# Architecture: CPU() or GPU(); the latter requires using CUDA package
+using CUDA
+arch = GPU()
 
 const λ_west = -30 # [°] longitude of west boundary
 const λ_east = +30 # [°] longitude of east boundary
@@ -22,12 +18,12 @@ const φ_north = 75 # [°] latitude of north boundary
 
 φ₀ = (φ_south + φ_north) / 2 # [°] latitude of the center of the domain
 
-Lλ = λ_east - λ_west   # [°] longitude extent of the domain
-Lφ = φ_north - φ_south # [°] latitude extent of the domain
+const Lλ = λ_east - λ_west   # [°] longitude extent of the domain
+const Lφ = φ_north - φ_south # [°] latitude extent of the domain
+const Lz = 2kilometers # depth [m]
 
-const Lz = 1.8kilometers # depth [m]
-
-Δt₀ = 11minutes
+Δt₀ = 30minutes
+Δt₀ = 20minutes
 stop_time = 365days
 
 Nλ = 160
@@ -38,17 +34,17 @@ Nλ = 80
 Nφ = 120
 Nz = 25
 
-z = ExponentialDiscretization(Nz, -Lz, 0, scale=Lz/3)
-
 grid = LatitudeLongitudeGrid(arch;
-                             size = (Nλ, Nφ, Nz), z,
+                             size = (Nλ, Nφ, Nz),
                              longitude = (λ_west, λ_east),
                              latitude = (φ_south, φ_north),
+                             z = ExponentialDiscretization(Nz, -Lz, 0, scale=Lz/3),
                              topology = (Bounded, Bounded, Bounded),
                              halo = (6, 6, 3))
 
 # We can plot vertical spacing versus depth to inspect the prescribed grid stretching.
 
+#=
 fig = Figure()
 ax = Axis(fig[1, 1],
           xlabel = "Vertical spacing (m)",
@@ -57,6 +53,7 @@ ax = Axis(fig[1, 1],
 scatterlines!(ax, grid.z.Δᵃᵃᶠ[1:Nz+1], grid.z.cᵃᵃᶠ[1:Nz+1])
 
 save("double_gyre_grid_spacing.pdf", fig)
+=#
 
 g  = Oceananigans.defaults.gravitational_acceleration
 α  = 2e-4 # [K⁻¹] thermal expansion coefficient
@@ -67,12 +64,12 @@ cᵖ = 3991 # [J K⁻¹ kg⁻¹] heat capacity for seawater
 
 parameters = (Lφ = Lφ,
               Lz = Lz,
-              φ₀ = φ₀,         # latitude of the center of the domain [°]
-               τ = 0.1 / ρ₀,   # surface kinematic wind stress [m² s⁻²]
-               μ = 0.001,      # bottom drag damping parameter [ms⁻¹]
-              Δb = 30 * α * g, # surface vertical buoyancy gradient [s⁻²]
-       timescale = 30days,     # relaxation time scale [s]
-              vˢ = Δzₛ/30days) # buoyancy pumping velocity [ms⁻¹]
+              φ₀ = φ₀,           # latitude of the center of the domain [°]
+               τ = 0.1 / ρ₀,     # surface kinematic wind stress [m² s⁻²]
+               μ = 0.001,        # bottom drag damping parameter [m s⁻¹]
+              Δb = 30 * α * g,   # surface vertical buoyancy gradient [s⁻²]
+       timescale = 30days,       # relaxation time scale [s]
+              vˢ = Δzₛ / 30days) # buoyancy pumping velocity [m s⁻¹]
 
 # ## Boundary conditions
 #
@@ -81,10 +78,11 @@ parameters = (Lφ = Lφ,
 
 # ### Buoyancy relaxation
 @inline surface_buoyancy(φ, p)             = p.Δb * (φ - p.φ₀) / p.Lφ
-@inline buoyancy_relaxation(λ, φ, t, b, p) = p.vˢ * (b - surface_buoyancy(φ, p))
+@inline buoyancy_relaxation(λ, φ, t, b, p) = - 1 / p.timescale * (b - surface_buoyancy(φ, p))
 
-φ = grid.φᵃᶜᵃ[1:grid.Ny]
 # ### Plotting surface forcing functions
+#=
+φ = grid.φᵃᶜᵃ[1:grid.Ny]
 fig = Figure()
 ax  = Axis(fig[1, 1],
            xlabel = "Buoyancy Profile",
@@ -103,19 +101,24 @@ ax = Axis(fig[1, 1],
 scatterlines!(ax, u_stress.(0, φ, 0, Ref(parameters)), φ)
 
 save("SurfaceWindStress.pdf", fig)
+=#
 
 # ### Bottom drag
 @inline u_drag(λ, φ, t, u, p) = - p.μ * u
 @inline v_drag(λ, φ, t, v, p) = - p.μ * v
 
+@inline u_drag(i, j, grid, clock, model_fields, p) = @inbounds - p.μ * model_fields.u[i, j, 1]
+@inline v_drag(i, j, grid, clock, model_fields, p) = @inbounds - p.μ * model_fields.v[i, j, 1]
+
+u_drag_bc = FluxBoundaryCondition(u_drag, discrete_form=true, parameters=parameters)
+v_drag_bc = FluxBoundaryCondition(v_drag, discrete_form=true, parameters=parameters)
+
 u_stress_bc = FluxBoundaryCondition(u_stress; parameters)
 b_relax_bc  = FluxBoundaryCondition(buoyancy_relaxation; field_dependencies = :b, parameters)
-u_drag_bc   = FluxBoundaryCondition(u_drag; field_dependencies = :u, parameters)
-v_drag_bc   = FluxBoundaryCondition(v_drag; field_dependencies = :v, parameters)
 
 u_bcs = FieldBoundaryConditions(top = u_stress_bc, bottom = u_drag_bc)
 v_bcs = FieldBoundaryConditions(                   bottom = v_drag_bc)
-b_bcs = FieldBoundaryConditions(top = b_relax_bc)
+b_bcs = FieldBoundaryConditions(top = b_relax_bc) # somehow I can't get this to work on GPU
 
 # ## Turbulence closure
 boundary_layer_closure     = RiBasedVerticalDiffusivity()
@@ -126,6 +129,7 @@ closures = (boundary_layer_closure, vertical_diffusive_closure)
 # ## Model building
 model = HydrostaticFreeSurfaceModel(; grid,
                                     free_surface = SplitExplicitFreeSurface(grid; cfl = 0.7),
+                                    # timestepper = :SplitRungeKutta3,
                                     momentum_advection = WENOVectorInvariant(),
                                     tracer_advection = WENO(),
                                     buoyancy = BuoyancyTracer(),
@@ -166,7 +170,7 @@ end
 simulation.callbacks[:progress] = Callback(progress, TimeInterval(24hours))
 
 # ## Output
-
+#=
 u, v, w = model.velocities
 b = model.tracers.b
 
@@ -189,9 +193,10 @@ simulation.output_writers[:barotropic_velocities] =
                schedule = AveragedTimeInterval(30days, window = 10days),
                filename = "double_gyre_circulation",
                overwrite_existing = true)
-
+=#
 run!(simulation)
 
+#=
 
 # # A neat movie
 
@@ -303,3 +308,4 @@ Colorbar(fig[2:3,4], hm_Ψ, labelsize = 22.5, labelpadding = 10.0, ticksize = 17
 save("double_gyre_circulation.pdf", fig)
 
 # ![](assets/double_gyre_circulation.svg)
+=#
