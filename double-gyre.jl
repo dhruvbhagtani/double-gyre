@@ -2,6 +2,8 @@
 
 using Oceananigans
 using Oceananigans.Units
+using Oceananigans.Grids: φnode
+using Oceananigans.Architectures: on_architecture
 
 using CairoMakie
 using Statistics
@@ -15,24 +17,21 @@ const λ_west = -30 # [°] longitude of west boundary
 const λ_east = +30 # [°] longitude of east boundary
 const φ_south = 15 # [°] latitude of south boundary
 const φ_north = 75 # [°] latitude of north boundary
-
-φ₀ = (φ_south + φ_north) / 2 # [°] latitude of the center of the domain
+const φ₀ = (φ_south + φ_north) / 2 # [°] latitude of the center of the domain
 
 const Lλ = λ_east - λ_west   # [°] longitude extent of the domain
 const Lφ = φ_north - φ_south # [°] latitude extent of the domain
 const Lz = 2kilometers # depth [m]
 
-Δt₀ = 30minutes
-Δt₀ = 20minutes
-stop_time = 365days
+# timestep and final time
+Δt = 30minutes # adjust depending on chosen resolution; 30min seems OK with 1/4 deg resolution + RK3 timestep
+stop_time = 10 * 365days
 
-Nλ = 160
-Nφ = 240
+# resolution
+resolution = 3 # corresponds to 1/resolution °
+Nλ = Integer(Lλ * resolution)
+Nφ = Integer(Lφ * resolution)
 Nz = 50
-
-Nλ = 80
-Nφ = 120
-Nz = 25
 
 grid = LatitudeLongitudeGrid(arch;
                              size = (Nλ, Nφ, Nz),
@@ -77,8 +76,12 @@ parameters = (Lφ = Lφ,
 @inline u_stress(λ, φ, t, p) = p.τ * sin(2π * (φ - p.φ₀) / p.Lφ)
 
 # ### Buoyancy relaxation
-@inline surface_buoyancy(φ, p)             = p.Δb * (φ - p.φ₀) / p.Lφ
-@inline buoyancy_relaxation(λ, φ, t, b, p) = - 1 / p.timescale * (b - surface_buoyancy(φ, p))
+@inline surface_buoyancy(φ, p) = p.Δb * (φ - p.φ₀) / p.Lφ
+@inline function buoyancy_relaxation(i, j, grid, clock, model_fields, p)
+    b = @inbounds model_fields.b[i, j, grid.Nz] # surface b
+    φ = φnode(j, grid, Center())
+    return - 1 / p.timescale * (b - surface_buoyancy(φ, p))
+end
 
 # ### Plotting surface forcing functions
 #=
@@ -104,9 +107,6 @@ save("SurfaceWindStress.pdf", fig)
 =#
 
 # ### Bottom drag
-@inline u_drag(λ, φ, t, u, p) = - p.μ * u
-@inline v_drag(λ, φ, t, v, p) = - p.μ * v
-
 @inline u_drag(i, j, grid, clock, model_fields, p) = @inbounds - p.μ * model_fields.u[i, j, 1]
 @inline v_drag(i, j, grid, clock, model_fields, p) = @inbounds - p.μ * model_fields.v[i, j, 1]
 
@@ -114,11 +114,11 @@ u_drag_bc = FluxBoundaryCondition(u_drag, discrete_form=true, parameters=paramet
 v_drag_bc = FluxBoundaryCondition(v_drag, discrete_form=true, parameters=parameters)
 
 u_stress_bc = FluxBoundaryCondition(u_stress; parameters)
-b_relax_bc  = FluxBoundaryCondition(buoyancy_relaxation; field_dependencies = :b, parameters)
+b_relax_bc  = FluxBoundaryCondition(buoyancy_relaxation, discrete_form=true, parameters=parameters)
 
 u_bcs = FieldBoundaryConditions(top = u_stress_bc, bottom = u_drag_bc)
 v_bcs = FieldBoundaryConditions(                   bottom = v_drag_bc)
-b_bcs = FieldBoundaryConditions(top = b_relax_bc) # somehow I can't get this to work on GPU
+b_bcs = FieldBoundaryConditions(top = b_relax_bc)
 
 # ## Turbulence closure
 boundary_layer_closure     = RiBasedVerticalDiffusivity()
@@ -129,48 +129,45 @@ closures = (boundary_layer_closure, vertical_diffusive_closure)
 # ## Model building
 model = HydrostaticFreeSurfaceModel(; grid,
                                     free_surface = SplitExplicitFreeSurface(grid; cfl = 0.7),
-                                    # timestepper = :SplitRungeKutta3,
+                                    timestepper = :SplitRungeKutta3,
                                     momentum_advection = WENOVectorInvariant(),
                                     tracer_advection = WENO(),
                                     buoyancy = BuoyancyTracer(),
                                     coriolis = HydrostaticSphericalCoriolis(),
                                     closure  = closures,
-                                    tracers  = :b,
+                                    tracers  = :b, # if boundary_layer_closure = RiBasedVerticalDiffusivity()
+                                    # tracers  = (:b, :e), # if boundary_layer_closure = CATKEVerticalDiffusivity()
                                     boundary_conditions = (u = u_bcs, v = v_bcs, b = b_bcs))
 
 # ## Initial conditions
-
 bᵢ(λ, φ, z) = parameters.Δb * z / grid.Lz
-
 set!(model, b = bᵢ)
 
 # ## Simulation setup
-
-simulation = Simulation(model, Δt = Δt₀, stop_time = stop_time)
+simulation = Simulation(model; Δt, stop_time)
 
 # add progress callback
 wall_clock = [time_ns()]
 
 function progress(sim)
-    @info @sprintf("[%05.2f%%] i: %d, t: %s, wall time: %s, max(u): (%6.2e, %6.2e, %6.2e) m s⁻¹, next Δt: %s\n",
+    @info @sprintf("[%05.2f%%] i: %d, t: %s, max(u): (%6.2e, %6.2e, %6.2e) m s⁻¹, Δt: %s, wall time: %s\n",
             100 * (sim.model.clock.time / sim.stop_time),
             sim.model.clock.iteration,
             prettytime(sim.model.clock.time),
-            prettytime(1e-9 * (time_ns() - wall_clock[1])),
             maximum(abs, sim.model.velocities.u),
             maximum(abs, sim.model.velocities.v),
             maximum(abs, sim.model.velocities.w),
-            prettytime(sim.Δt))
+            prettytime(sim.Δt),
+            prettytime(1e-9 * (time_ns() - wall_clock[1])))
 
     wall_clock[1] = time_ns()
 
     return nothing
 end
 
-simulation.callbacks[:progress] = Callback(progress, TimeInterval(24hours))
+simulation.callbacks[:progress] = Callback(progress, TimeInterval(7days))
 
 # ## Output
-#=
 u, v, w = model.velocities
 b = model.tracers.b
 
@@ -193,17 +190,15 @@ simulation.output_writers[:barotropic_velocities] =
                schedule = AveragedTimeInterval(30days, window = 10days),
                filename = "double_gyre_circulation",
                overwrite_existing = true)
-=#
+
 run!(simulation)
 
-#=
 
 # # A neat movie
 
 # We open the JLD2 file, and extract the `grid` and the iterations we ended up saving at.
 
 filename = "double_gyre.jld2"
-
 u_timeseries = FieldTimeSeries(filename, "u"; architecture = CPU())
 v_timeseries = FieldTimeSeries(filename, "v"; architecture = CPU())
 s_timeseries = FieldTimeSeries(filename, "speed"; architecture = CPU())
@@ -233,26 +228,19 @@ slims = extrema(s_timeseries.data) .* extrema_reduction_factor
 fig = Figure(size = (1650, 1250))
 
 title_u = @lift "Zonal Velocity after " *string(round(times[$n]/day, digits = 1))*" days"
-ax_u = Axis(fig[1:2,1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)", xlabelsize = 22.5,
-            ylabelsize = 22.5, xticklabelsize = 17.5, yticklabelsize = 17.5, xlabelpadding = 10, ylabelpadding = 10,
-            aspect = 1.0, title = title_u, titlesize = 27.5, titlegap = 15, titlefont = :bold)
+ax_u = Axis(fig[1:2,1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
 hm_u = heatmap!(ax_u, λᵤ, φᵤ, u; colorrange = ulims, colormap = :balance)
-Colorbar(fig[1:2,2], hm_u; label = "Zonal velocity (m s⁻¹)", labelsize = 22.5, labelpadding = 10.0, ticksize = 17.5)
+Colorbar(fig[1:2,2], hm_u; label = "Zonal velocity (m s⁻¹)")
 
 title_v = @lift "Meridional Velocity after " *string(round(times[$n]/day, digits = 1))*" days"
-ax_v = Axis(fig[3:4,1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)", xlabelsize = 22.5,
-            ylabelsize = 22.5, xticklabelsize = 17.5, yticklabelsize = 17.5, xlabelpadding = 10, ylabelpadding = 10,
-            aspect = 1.0, title = title_v, titlesize = 27.5, titlegap = 15, titlefont = :bold)
+ax_v = Axis(fig[3:4,1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
 hm_v = heatmap!(ax_v, λᵥ, φᵥ, v; colorrange = vlims, colormap = :balance)
-Colorbar(fig[3:4,2], hm_v; label = "Meridional velocity (m s⁻¹)", labelsize = 22.5, labelpadding = 10.0,
-         ticksize = 17.5)
+Colorbar(fig[3:4,2], hm_v; label = "Meridional velocity (m s⁻¹)")
 
 title_s = @lift "Speed after " *string(round(times[$n]/day, digits = 1))*" days"
-ax_s = Axis(fig[2:3,3]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)", xlabelsize = 22.5,
-            ylabelsize = 22.5, xticklabelsize = 17.5, yticklabelsize = 17.5, xlabelpadding = 10, ylabelpadding = 10,
-            aspect = 1.0, title = title_s, titlesize = 27.5, titlegap = 15, titlefont = :bold)
+ax_s = Axis(fig[2:3,3]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
 hm_s = heatmap!(ax_s, λₛ, φₛ, s; colorrange = slims, colormap = :balance)
-Colorbar(fig[2:3,4], hm_s; label = "Speed (m s⁻¹)", labelsize = 22.5, labelpadding = 10.0, ticksize = 17.5)
+Colorbar(fig[2:3,4], hm_s; label = "Speed (m s⁻¹)")
 
 frames = 1:length(times)
 
@@ -262,50 +250,40 @@ CairoMakie.record(fig, filename * ".mp4", frames, framerate = 8) do i
     n[] = i
 end
 
-nothing # hide
 
 # Plot the barotropic circulation
 
 filename_barotropic = "double_gyre_circulation.jld2"
 
-U_timeseries = FieldTimeSeries(filename_barotropic, "u"; grid = grid, architecture = CPU())
-V_timeseries = FieldTimeSeries(filename_barotropic, "v"; grid = grid, architecture = CPU())
+U_timeseries = FieldTimeSeries(filename_barotropic, "u"; grid, architecture = CPU())
+V_timeseries = FieldTimeSeries(filename_barotropic, "v"; grid, architecture = CPU())
 
-# Average for the last `n_years`
-
-n_years = 5
-
-U = mean(interior(U_timeseries)[:, :, :, end:end], dims = 4)[:, :, 1, 1]
-V = mean(interior(V_timeseries)[:, :, :, end:end], dims = 4)[:, :, 1, 1]
+# time-average; adjust accordingly to avoid spinup
+U_mean = Field{location(U_timeseries)...}(on_architecture(CPU(), grid))
+V_mean = Field{location(V_timeseries)...}(on_architecture(CPU(), grid))
+for iter in 1:length(U_timeseries)
+    parent(U_mean) .= parent(U_mean) * (iter - 1) / iter .+ parent(U_timeseries[iter]) / iter
+    parent(V_mean) .= parent(V_mean) * (iter - 1) / iter .+ parent(V_timeseries[iter]) / iter
+end
 
 fig = Figure(size = (1650, 1250))
 
 title_U = "Depth- and Time-Averaged Zonal Velocity"
-ax_U = Axis(fig[1:2,1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)", xlabelsize = 22.5,
-            ylabelsize = 22.5, xticklabelsize = 17.5, yticklabelsize = 17.5, xlabelpadding = 10, ylabelpadding = 10,
-            aspect = 1.0, title = title_U, titlesize = 27.5, titlegap = 15, titlefont = :bold)
-hm_U = heatmap!(ax_U, λᵤ, φᵤ, U; colorrange = ulims, colormap = :balance)
-Colorbar(fig[1:2,2], hm_U, labelsize = 22.5, labelpadding = 10.0, ticksize = 17.5)
+ax_U = Axis(fig[1:2,1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
+hm_U = heatmap!(ax_U, λᵤ, φᵤ, U_mean; colorrange = ulims, colormap = :balance)
+Colorbar(fig[1:2,2], hm_U)
 
 title_V = "Depth- and Time-Averaged Meridional Velocity"
-ax_V = Axis(fig[3:4,1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)", xlabelsize = 22.5,
-            ylabelsize = 22.5, xticklabelsize = 17.5, yticklabelsize = 17.5, xlabelpadding = 10, ylabelpadding = 10,
-            aspect = 1.0, title = title_V, titlesize = 27.5, titlegap = 15, titlefont = :bold)
-hm_V = heatmap!(ax_V, λᵥ, φᵥ, V; colorrange = vlims, colormap = :balance)
-Colorbar(fig[3:4,2], hm_V, labelsize = 22.5, labelpadding = 10.0, ticksize = 17.5)
+ax_V = Axis(fig[3:4,1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
+hm_V = heatmap!(ax_V, λᵥ, φᵥ, V_mean; colorrange = vlims, colormap = :balance)
+Colorbar(fig[3:4,2], hm_V)
 
-yspacings_CPU = yspacings(grid_CPU, Center(), Center())
-Ψ = -cumsum(U, dims = 2) * yspacings_CPU * grid.Lz * 1e-6
+Ψ = CumulativeIntegral(- U_mean, dims = 2) |> Field
 Ψlims = extrema(Ψ) .* extrema_reduction_factor
 
 title_Ψ = "Barotropic Streamfunction"
-ax_Ψ = Axis(fig[2:3,3]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)", xlabelsize = 22.5,
-            ylabelsize = 22.5, xticklabelsize = 17.5, yticklabelsize = 17.5, xlabelpadding = 10, ylabelpadding = 10,
-            aspect = 1.0, title = title_Ψ, titlesize = 27.5, titlegap = 15, titlefont = :bold)
+ax_Ψ = Axis(fig[2:3,3]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
 hm_Ψ = heatmap!(ax_Ψ, λᵤ, φᵤ, Ψ; colorrange = Ψlims, colormap = :balance)
-Colorbar(fig[2:3,4], hm_Ψ, labelsize = 22.5, labelpadding = 10.0, ticksize = 17.5)
+Colorbar(fig[2:3,4], hm_Ψ)
 
 save("double_gyre_circulation.pdf", fig)
-
-# ![](assets/double_gyre_circulation.svg)
-=#
