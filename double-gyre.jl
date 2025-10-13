@@ -24,14 +24,14 @@ const Lφ = φ_north - φ_south # [°] latitude extent of the domain
 const Lz = 2kilometers # depth [m]
 
 # timestep and final time
-Δt = 30minutes # adjust depending on chosen resolution; 30min seems OK with 1/4 deg resolution + RK3 timestep
+Δt = 45minutes # adjust depending on chosen resolution; 30min seems OK with 1/4 deg resolution + RK3 timestep
 stop_time = 10 * 365days
 
 # resolution
-resolution = 3 # corresponds to 1/resolution °
+resolution = 2 # corresponds to 1/resolution in degrees
 Nλ = Integer(Lλ * resolution)
 Nφ = Integer(Lφ * resolution)
-Nz = 50
+Nz = 35
 
 grid = LatitudeLongitudeGrid(arch;
                              size = (Nλ, Nφ, Nz),
@@ -228,19 +228,19 @@ slims = extrema(s_timeseries.data) .* extrema_reduction_factor
 fig = Figure(size = (1650, 1250))
 
 title_u = @lift "Zonal Velocity after " *string(round(times[$n]/day, digits = 1))*" days"
-ax_u = Axis(fig[1:2,1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
+ax_u = Axis(fig[1:2, 1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
 hm_u = heatmap!(ax_u, λᵤ, φᵤ, u; colorrange = ulims, colormap = :balance)
-Colorbar(fig[1:2,2], hm_u; label = "Zonal velocity (m s⁻¹)")
+Colorbar(fig[1:2, 2], hm_u; label = "Zonal velocity (m s⁻¹)")
 
 title_v = @lift "Meridional Velocity after " *string(round(times[$n]/day, digits = 1))*" days"
-ax_v = Axis(fig[3:4,1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
+ax_v = Axis(fig[3:4, 1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
 hm_v = heatmap!(ax_v, λᵥ, φᵥ, v; colorrange = vlims, colormap = :balance)
-Colorbar(fig[3:4,2], hm_v; label = "Meridional velocity (m s⁻¹)")
+Colorbar(fig[3:4, 2], hm_v; label = "Meridional velocity (m s⁻¹)")
 
 title_s = @lift "Speed after " *string(round(times[$n]/day, digits = 1))*" days"
-ax_s = Axis(fig[2:3,3]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
+ax_s = Axis(fig[2:3, 3]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
 hm_s = heatmap!(ax_s, λₛ, φₛ, s; colorrange = slims, colormap = :balance)
-Colorbar(fig[2:3,4], hm_s; label = "Speed (m s⁻¹)")
+Colorbar(fig[2:3, 4], hm_s; label = "Speed (m s⁻¹)")
 
 frames = 1:length(times)
 
@@ -259,8 +259,8 @@ U_timeseries = FieldTimeSeries(filename_barotropic, "u"; grid, architecture = CP
 V_timeseries = FieldTimeSeries(filename_barotropic, "v"; grid, architecture = CPU())
 
 # time-average; adjust accordingly to avoid spinup
-U_mean = Field{location(U_timeseries)...}(on_architecture(CPU(), grid))
-V_mean = Field{location(V_timeseries)...}(on_architecture(CPU(), grid))
+U_mean = Field{Oceananigans.Fields.location(U_timeseries)...}(on_architecture(CPU(), grid))
+V_mean = Field{Oceananigans.Fields.location(V_timeseries)...}(on_architecture(CPU(), grid))
 for iter in 1:length(U_timeseries)
     parent(U_mean) .= parent(U_mean) * (iter - 1) / iter .+ parent(U_timeseries[iter]) / iter
     parent(V_mean) .= parent(V_mean) * (iter - 1) / iter .+ parent(V_timeseries[iter]) / iter
@@ -269,21 +269,21 @@ end
 fig = Figure(size = (1650, 1250))
 
 title_U = "Depth- and Time-Averaged Zonal Velocity"
-ax_U = Axis(fig[1:2,1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
+ax_U = Axis(fig[1:2, 1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
 hm_U = heatmap!(ax_U, λᵤ, φᵤ, U_mean; colorrange = ulims, colormap = :balance)
-Colorbar(fig[1:2,2], hm_U)
+Colorbar(fig[1:2, 2], hm_U)
 
 title_V = "Depth- and Time-Averaged Meridional Velocity"
-ax_V = Axis(fig[3:4,1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
+ax_V = Axis(fig[3:4, 1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
 hm_V = heatmap!(ax_V, λᵥ, φᵥ, V_mean; colorrange = vlims, colormap = :balance)
-Colorbar(fig[3:4,2], hm_V)
+Colorbar(fig[3:4, 2], hm_V)
 
 Ψ = CumulativeIntegral(- U_mean, dims = 2) |> Field
 Ψlims = extrema(Ψ) .* extrema_reduction_factor
 
 title_Ψ = "Barotropic Streamfunction"
-ax_Ψ = Axis(fig[2:3,3]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
+ax_Ψ = Axis(fig[2:3, 3]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
 hm_Ψ = heatmap!(ax_Ψ, λᵤ, φᵤ, Ψ; colorrange = Ψlims, colormap = :balance)
-Colorbar(fig[2:3,4], hm_Ψ)
+Colorbar(fig[2:3, 4], hm_Ψ)
 
 save("double_gyre_circulation.pdf", fig)
