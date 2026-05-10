@@ -4,6 +4,7 @@ using Oceananigans
 using Oceananigans.Units
 using Oceananigans.Grids: φnode
 using Oceananigans.Architectures: on_architecture
+using Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid, ImmersedBoundaryCondition, PartialCellBottom
 
 using CairoMakie
 using Statistics
@@ -32,14 +33,17 @@ resolution = 4 # corresponds to 1/resolution in degrees
 Nλ = Integer(Lλ * resolution)
 Nφ = Integer(Lφ * resolution)
 Nz = 35
+use_sloping_sidewalls = true
 
-grid = LatitudeLongitudeGrid(arch;
-                             size = (Nλ, Nφ, Nz),
-                             longitude = (λ_west, λ_east),
-                             latitude = (φ_south, φ_north),
-                             z = ExponentialDiscretization(Nz, -Lz, 0, scale=Lz/3),
-                             topology = (Bounded, Bounded, Bounded),
-                             halo = (6, 6, 3))
+underlying_grid = LatitudeLongitudeGrid(arch;
+                                        size = (Nλ, Nφ, Nz),
+                                        longitude = (λ_west, λ_east),
+                                        latitude = (φ_south, φ_north),
+                                        z = ExponentialDiscretization(Nz, -Lz, 0, scale=Lz/3),
+                                        topology = (Bounded, Bounded, Bounded),
+                                        halo = (7, 7, 4))
+
+@inline tanh_ramp(ξ, sharpness) = (tanh(sharpness * (ξ - 0.5)) + tanh(sharpness / 2)) / (2 * tanh(sharpness / 2))
 
 # We can plot vertical spacing versus depth to inspect the prescribed grid stretching.
 
@@ -59,16 +63,39 @@ g  = Oceananigans.defaults.gravitational_acceleration
 cᵖ = 3991 # [J K⁻¹ kg⁻¹] heat capacity for seawater
 ρ₀ = 1028 # [kg m⁻³] reference seawater density
 
-Δzₛ = minimum_zspacing(grid) # vertical spacing at the surface [m]
+Δzₛ = minimum_zspacing(underlying_grid) # vertical spacing at the surface [m]
 
 parameters = (Lφ = Lφ,
               Lz = Lz,
               φ₀ = φ₀,           # latitude of the center of the domain [°]
                τ = 0.1 / ρ₀,     # surface kinematic wind stress [m² s⁻²]
                μ = 0.001,        # bottom drag damping parameter [m s⁻¹]
+     λ_slope_width = 7.5,        # west/east sidewall width [°]
+     φ_slope_width = 7.5,        # south/north sidewall width [°]
+    slope_sharpness = 3.5,       # nondimensional steepness of tanh sidewall transition
               Δb = 30 * α * g,   # surface vertical buoyancy gradient [s⁻²]
        timescale = 30days,       # relaxation time scale [s]
               vˢ = Δzₛ / 30days) # buoyancy pumping velocity [m s⁻¹]
+
+function sidewall_bathymetry(λ, φ, p)
+    ξx = clamp(min((λ - λ_west) / p.λ_slope_width,
+                   (λ_east - λ) / p.λ_slope_width), 0, 1)
+    ξy = clamp(min((φ - φ_south) / p.φ_slope_width,
+                   (φ_north - φ) / p.φ_slope_width), 0, 1)
+
+    # Euclidean blending removes the crease at corners by combining the
+    # distances to the adjacent walls into a single smooth radial coordinate.
+    ξ = clamp(sqrt(ξx^2 + ξy^2), 0, 1)
+    return -p.Lz * tanh_ramp(ξ, p.slope_sharpness)
+end
+
+if use_sloping_sidewalls
+    immersed_boundary = PartialCellBottom((λ, φ) -> sidewall_bathymetry(λ, φ, parameters);
+                                          minimum_fractional_cell_height = 0.2)
+    grid = ImmersedBoundaryGrid(underlying_grid, immersed_boundary)
+else
+    grid = underlying_grid
+end
 
 # ## Boundary conditions
 #
@@ -110,14 +137,27 @@ save("SurfaceWindStress.pdf", fig)
 @inline u_drag(i, j, grid, clock, model_fields, p) = @inbounds - p.μ * model_fields.u[i, j, 1]
 @inline v_drag(i, j, grid, clock, model_fields, p) = @inbounds - p.μ * model_fields.v[i, j, 1]
 
+@inline u_immersed_drag(i, j, k, grid, clock, model_fields, p) = @inbounds - p.μ * model_fields.u[i, j, k]
+@inline v_immersed_drag(i, j, k, grid, clock, model_fields, p) = @inbounds - p.μ * model_fields.v[i, j, k]
+
 u_drag_bc = FluxBoundaryCondition(u_drag, discrete_form=true, parameters=parameters)
 v_drag_bc = FluxBoundaryCondition(v_drag, discrete_form=true, parameters=parameters)
+u_immersed_drag_bc = FluxBoundaryCondition(u_immersed_drag, discrete_form=true, parameters=parameters)
+v_immersed_drag_bc = FluxBoundaryCondition(v_immersed_drag, discrete_form=true, parameters=parameters)
 
 u_stress_bc = FluxBoundaryCondition(u_stress; parameters)
 b_relax_bc  = FluxBoundaryCondition(buoyancy_relaxation, discrete_form=true, parameters=parameters)
 
-u_bcs = FieldBoundaryConditions(top = u_stress_bc, bottom = u_drag_bc)
-v_bcs = FieldBoundaryConditions(                   bottom = v_drag_bc)
+if use_sloping_sidewalls
+    u_immersed_bcs = ImmersedBoundaryCondition(bottom = u_immersed_drag_bc)
+    v_immersed_bcs = ImmersedBoundaryCondition(bottom = v_immersed_drag_bc)
+
+    u_bcs = FieldBoundaryConditions(top = u_stress_bc, bottom = u_drag_bc, immersed = u_immersed_bcs)
+    v_bcs = FieldBoundaryConditions(                   bottom = v_drag_bc, immersed = v_immersed_bcs)
+else
+    u_bcs = FieldBoundaryConditions(top = u_stress_bc, bottom = u_drag_bc)
+    v_bcs = FieldBoundaryConditions(                   bottom = v_drag_bc)
+end
 b_bcs = FieldBoundaryConditions(top = b_relax_bc)
 
 # ## Turbulence closure
