@@ -12,7 +12,7 @@ using Printf
 
 # Architecture: CPU() or GPU(); the latter requires using CUDA package
 using CUDA
-arch = GPU()
+arch = CPU()
 
 const λ_west = -30 # [°] longitude of west boundary
 const λ_east = +30 # [°] longitude of east boundary
@@ -34,6 +34,9 @@ Nλ = Integer(Lλ * resolution)
 Nφ = Integer(Lφ * resolution)
 Nz = 35
 use_sloping_sidewalls = true
+
+# bottom drag type: :linear or :quadratic
+drag_type = :linear
 
 underlying_grid = LatitudeLongitudeGrid(arch;
                                         size = (Nλ, Nφ, Nz),
@@ -70,6 +73,7 @@ parameters = (Lφ = Lφ,
               φ₀ = φ₀,           # latitude of the center of the domain [°]
                τ = 0.1 / ρ₀,     # surface kinematic wind stress [m² s⁻²]
                μ = 0.001,        # bottom drag damping parameter [m s⁻¹]
+      drag_type = drag_type,    # :linear or :quadratic
      λ_slope_width = 7.5,        # west/east sidewall width [°]
      φ_slope_width = 7.5,        # south/north sidewall width [°]
     slope_sharpness = 3.5,       # nondimensional steepness of tanh sidewall transition
@@ -134,11 +138,43 @@ save("SurfaceWindStress.pdf", fig)
 =#
 
 # ### Bottom drag
-@inline u_drag(i, j, grid, clock, model_fields, p) = @inbounds - p.μ * model_fields.u[i, j, 1]
-@inline v_drag(i, j, grid, clock, model_fields, p) = @inbounds - p.μ * model_fields.v[i, j, 1]
+# Linear drag: -μ * u
+# Quadratic drag: -μ * |u| * u (sign-preserving)
+@inline function u_drag(i, j, grid, clock, model_fields, p)
+    u = @inbounds model_fields.u[i, j, 1]
+    if p.drag_type == :quadratic
+        return - p.μ * abs(u) * u
+    else  # linear
+        return - p.μ * u
+    end
+end
 
-@inline u_immersed_drag(i, j, k, grid, clock, model_fields, p) = @inbounds - p.μ * model_fields.u[i, j, k]
-@inline v_immersed_drag(i, j, k, grid, clock, model_fields, p) = @inbounds - p.μ * model_fields.v[i, j, k]
+@inline function v_drag(i, j, grid, clock, model_fields, p)
+    v = @inbounds model_fields.v[i, j, 1]
+    if p.drag_type == :quadratic
+        return - p.μ * abs(v) * v
+    else  # linear
+        return - p.μ * v
+    end
+end
+
+@inline function u_immersed_drag(i, j, k, grid, clock, model_fields, p)
+    u = @inbounds model_fields.u[i, j, k]
+    if p.drag_type == :quadratic
+        return - p.μ * abs(u) * u
+    else  # linear
+        return - p.μ * u
+    end
+end
+
+@inline function v_immersed_drag(i, j, k, grid, clock, model_fields, p)
+    v = @inbounds model_fields.v[i, j, k]
+    if p.drag_type == :quadratic
+        return - p.μ * abs(v) * v
+    else  # linear
+        return - p.μ * v
+    end
+end
 
 u_drag_bc = FluxBoundaryCondition(u_drag, discrete_form=true, parameters=parameters)
 v_drag_bc = FluxBoundaryCondition(v_drag, discrete_form=true, parameters=parameters)
