@@ -14,8 +14,8 @@ using Statistics
 using Printf
 
 # Architecture: CPU() or GPU(); the latter requires using CUDA package
-#using CUDA
-arch = CPU()
+using CUDA
+arch = GPU()
 
 const λ_west = -30 # [°] longitude of west boundary
 const λ_east = +30 # [°] longitude of east boundary
