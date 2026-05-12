@@ -2,16 +2,19 @@
 
 using Oceananigans
 using Oceananigans.Units
-using Oceananigans.Grids: φnode
+using Oceananigans.AbstractOperations: KernelFunctionOperation
+using Oceananigans.Fields: FunctionField
+using Oceananigans.Grids: φnode, nodes, xspacings, yspacings, zspacings
 using Oceananigans.Architectures: on_architecture
 using Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid, ImmersedBoundaryCondition, PartialCellBottom
 
 using CairoMakie
+using NCDatasets
 using Statistics
 using Printf
 
 # Architecture: CPU() or GPU(); the latter requires using CUDA package
-using CUDA
+#using CUDA
 arch = CPU()
 
 const λ_west = -30 # [°] longitude of west boundary
@@ -47,19 +50,6 @@ underlying_grid = LatitudeLongitudeGrid(arch;
                                         halo = (7, 7, 4))
 
 @inline tanh_ramp(ξ, sharpness) = (tanh(sharpness * (ξ - 0.5)) + tanh(sharpness / 2)) / (2 * tanh(sharpness / 2))
-
-# We can plot vertical spacing versus depth to inspect the prescribed grid stretching.
-
-#=
-fig = Figure()
-ax = Axis(fig[1, 1],
-          xlabel = "Vertical spacing (m)",
-          ylabel = "Depth (m)",
-          title = "Variation of Vertical Spacing with Depth")
-scatterlines!(ax, grid.z.Δᵃᵃᶠ[1:Nz+1], grid.z.cᵃᵃᶠ[1:Nz+1])
-
-save("double_gyre_grid_spacing.pdf", fig)
-=#
 
 g  = Oceananigans.defaults.gravitational_acceleration
 α  = 2e-4 # [K⁻¹] thermal expansion coefficient
@@ -114,32 +104,6 @@ end
     return - 1 / p.timescale * (b - surface_buoyancy(φ, p))
 end
 
-# ### Plotting surface forcing functions
-#=
-φ = grid.φᵃᶜᵃ[1:grid.Ny]
-fig = Figure()
-ax  = Axis(fig[1, 1],
-           xlabel = "Buoyancy Profile",
-           ylabel = "Latitude (Degree)",
-           title = "Surface Buoyancy Forcing")
-scatterlines!(ax, surface_buoyancy.(φ, Ref(parameters)), φ)
-
-save("SurfaceBuoyancyForcing.pdf", fig)
-
-
-fig = Figure()
-ax = Axis(fig[1, 1],
-          xlabel = "Wind Stress Profile",
-          ylabel = "Latitude (Degree)",
-          title = "Surface Wind Stress")
-scatterlines!(ax, u_stress.(0, φ, 0, Ref(parameters)), φ)
-
-save("SurfaceWindStress.pdf", fig)
-=#
-
-# ### Bottom drag
-# Linear drag: -μ * u
-# Quadratic drag: -μ * |u| * u (sign-preserving)
 @inline function u_drag(i, j, grid, clock, model_fields, p)
     u = @inbounds model_fields.u[i, j, 1]
     if p.drag_type == :quadratic
@@ -174,6 +138,30 @@ end
     else  # linear
         return - p.μ * v
     end
+end
+
+@inline function u_bottom_drag(i, j, k, grid, u, p)
+    u★ = @inbounds u[i, j, 1]
+    if p.drag_type == :quadratic
+        return - p.μ * abs(u★) * u★
+    else
+        return - p.μ * u★
+    end
+end
+
+@inline function v_bottom_drag(i, j, k, grid, v, p)
+    v★ = @inbounds v[i, j, 1]
+    if p.drag_type == :quadratic
+        return - p.μ * abs(v★) * v★
+    else
+        return - p.μ * v★
+    end
+end
+
+@inline function surface_buoyancy_forcing(i, j, k, grid, b, p)
+    b★ = @inbounds b[i, j, grid.Nz]
+    φ = φnode(j, grid, Center())
+    return - 1 / p.timescale * (b★ - surface_buoyancy(φ, p))
 end
 
 u_drag_bc = FluxBoundaryCondition(u_drag, discrete_form=true, parameters=parameters)
@@ -244,6 +232,79 @@ end
 simulation.callbacks[:progress] = Callback(progress, TimeInterval(7days))
 
 # ## Output
+
+metric_grid(grid) = grid
+metric_grid(grid::ImmersedBoundaryGrid) = grid.underlying_grid
+
+function horizontal_metric_array(operation)
+    field = compute!(Field(operation))
+    return Array(interior(field, :, :, 1))
+end
+
+function vertical_metric_array(operation)
+    field = compute!(Field(operation))
+    return vec(Array(interior(field, 1, 1, :)))
+end
+
+function define_coordinate!(ds, name, values; long_name, units)
+    defDim(ds, name, length(values))
+    variable = defVar(ds, name, Float64, (name,),
+                      attrib = Dict("long_name" => long_name, "units" => units))
+    variable[:] = Array(values)
+    return nothing
+end
+
+function define_static_variable!(ds, name, values, dims; long_name, units)
+    variable = defVar(ds, name, Float64, dims,
+                      attrib = Dict("long_name" => long_name, "units" => units))
+    variable[ntuple(_ -> Colon(), ndims(values))...] = values
+    return nothing
+end
+
+function write_static_grid_file(grid; filename = "double_gyre_grid.nc")
+    grid = metric_grid(grid)
+
+    λc, φc, zc = nodes(grid, Center(), Center(), Center())
+    λf, φf, zf = nodes(grid, Face(),   Face(),   Face())
+
+    NCDataset(filename, "c") do ds
+        ds.attrib["title"] = "Static grid metrics for double gyre simulation"
+        ds.attrib["description"] = "Horizontal spacings are saved at all tracer and velocity C-grid horizontal locations."
+
+        define_coordinate!(ds, "lon_c", λc; long_name = "Longitude at cell centers", units = "degrees_east")
+        define_coordinate!(ds, "lon_f", λf; long_name = "Longitude at cell faces",   units = "degrees_east")
+        define_coordinate!(ds, "lat_c", φc; long_name = "Latitude at cell centers",  units = "degrees_north")
+        define_coordinate!(ds, "lat_f", φf; long_name = "Latitude at cell faces",    units = "degrees_north")
+        define_coordinate!(ds, "z_c",   zc; long_name = "Height at cell centers",    units = "m")
+        define_coordinate!(ds, "z_f",   zf; long_name = "Height at cell faces",      units = "m")
+
+        define_static_variable!(ds, "dx_cc", horizontal_metric_array(xspacings(grid, Center(), Center())),
+                                ("lon_c", "lat_c"); long_name = "Zonal spacing at tracer points", units = "m")
+        define_static_variable!(ds, "dx_fc", horizontal_metric_array(xspacings(grid, Face(), Center())),
+                                ("lon_f", "lat_c"); long_name = "Zonal spacing at u points", units = "m")
+        define_static_variable!(ds, "dx_cf", horizontal_metric_array(xspacings(grid, Center(), Face())),
+                                ("lon_c", "lat_f"); long_name = "Zonal spacing at v points", units = "m")
+        define_static_variable!(ds, "dx_ff", horizontal_metric_array(xspacings(grid, Face(), Face())),
+                                ("lon_f", "lat_f"); long_name = "Zonal spacing at horizontal cell corners", units = "m")
+
+        define_static_variable!(ds, "dy_cc", horizontal_metric_array(yspacings(grid, Center(), Center())),
+                                ("lon_c", "lat_c"); long_name = "Meridional spacing at tracer points", units = "m")
+        define_static_variable!(ds, "dy_fc", horizontal_metric_array(yspacings(grid, Face(), Center())),
+                                ("lon_f", "lat_c"); long_name = "Meridional spacing at u points", units = "m")
+        define_static_variable!(ds, "dy_cf", horizontal_metric_array(yspacings(grid, Center(), Face())),
+                                ("lon_c", "lat_f"); long_name = "Meridional spacing at v points", units = "m")
+        define_static_variable!(ds, "dy_ff", horizontal_metric_array(yspacings(grid, Face(), Face())),
+                                ("lon_f", "lat_f"); long_name = "Meridional spacing at horizontal cell corners", units = "m")
+
+        define_static_variable!(ds, "dz_c", vertical_metric_array(zspacings(grid, Center())),
+                                ("z_c",); long_name = "Vertical spacing at cell centers", units = "m")
+        define_static_variable!(ds, "dz_f", vertical_metric_array(zspacings(grid, Face())),
+                                ("z_f",); long_name = "Vertical spacing at cell faces", units = "m")
+    end
+
+    return nothing
+end
+
 u, v, w = model.velocities
 b = model.tracers.b
 
@@ -266,6 +327,36 @@ simulation.output_writers[:barotropic_velocities] =
                schedule = AveragedTimeInterval(30days, window = 10days),
                filename = "double_gyre_circulation",
                overwrite_existing = true)
+
+tau_s = FunctionField{Face, Center, Nothing}(u_stress, grid; clock = model.clock, parameters)
+tau_b_u = Field(KernelFunctionOperation{Face, Center, Nothing}(u_bottom_drag, grid, u, parameters))
+tau_b_v = Field(KernelFunctionOperation{Center, Face, Nothing}(v_bottom_drag, grid, v, parameters))
+surface_buoyancy_flux = Field(KernelFunctionOperation{Center, Center, Nothing}(surface_buoyancy_forcing, grid, b, parameters))
+
+monthly_outputs = (u = u,
+                   v = v,
+                   w = w,
+                   b = b,
+                   tau_s = tau_s,
+                   tau_b_u = tau_b_u,
+                   tau_b_v = tau_b_v,
+                   surface_buoyancy_forcing = surface_buoyancy_flux)
+
+monthly_output_attributes = Dict(
+    "tau_s" => Dict("long_name" => "Surface zonal kinematic wind stress", "units" => "m2 s-2"),
+    "tau_b_u" => Dict("long_name" => "Bottom zonal kinematic drag", "units" => "m2 s-2"),
+    "tau_b_v" => Dict("long_name" => "Bottom meridional kinematic drag", "units" => "m2 s-2"),
+    "surface_buoyancy_forcing" => Dict("long_name" => "Surface buoyancy forcing", "units" => "m s-3"))
+
+simulation.output_writers[:monthly_means] =
+    NetCDFWriter(model, monthly_outputs;
+                 schedule = AveragedTimeInterval(30days),
+                 filename = "double_gyre_monthly_means.nc",
+                 include_grid_metrics = false,
+                 output_attributes = monthly_output_attributes,
+                 overwrite_existing = true)
+
+write_static_grid_file(grid)
 
 run!(simulation)
 
