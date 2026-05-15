@@ -9,7 +9,7 @@ First [install Julia](https://julialang.org/downloads/); suggested version 1.10.
 Then clone this repository
 
 ```bash
-git clone git@github.com:navidcy/double-gyre.git
+git clone git@github.com:dhruvbhagtani/double-gyre.git
 ```
 
 Open Julia from within the local directory of the repo via:
