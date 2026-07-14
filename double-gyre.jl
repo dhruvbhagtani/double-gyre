@@ -87,9 +87,9 @@ function sidewall_bathymetry(λ, φ, p)
     ξy = clamp(min((φ - φ_south) / p.φ_slope_width,
                    (φ_north - φ) / p.φ_slope_width), 0, 1)
 
-    # Euclidean blending removes the crease at corners by combining the
-    # distances to the adjacent walls into a single smooth radial coordinate.
-    ξ = clamp(sqrt(ξx^2 + ξy^2), 0, 1)
+    # Use the normalized distance to the nearest lateral wall so that the
+    # bathymetry rises to z = 0 along all four boundaries.
+    ξ = min(ξx, ξy)
     return -p.Lz * tanh_ramp(ξ, p.slope_sharpness)
 end
 
