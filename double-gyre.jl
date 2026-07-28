@@ -2,7 +2,7 @@
 
 using Oceananigans
 using Oceananigans.Units
-using Oceananigans.Grids: φnode
+using Oceananigans.Grids: φnode, inactive_node
 using Oceananigans.Architectures: on_architecture
 using Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid, ImmersedBoundaryCondition, PartialCellBottom
 
@@ -26,7 +26,9 @@ const Lz = 2kilometers # depth [m]
 
 # timestep and final time
 Δt = 30minutes # adjust depending on chosen resolution; 30min seems OK with 1/4 deg resolution + RK3 timestep
-stop_time = 20 * 365days
+model_year = 365days
+model_month = model_year / 12
+stop_time = 20 * model_year
 
 # resolution
 resolution = 4 # corresponds to 1/resolution in degrees
@@ -48,7 +50,17 @@ function parse_drag_type(value)
 end
 
 drag_type = parse_drag_type(get(ENV, "DRAG_TYPE", "linear"))
+linear_drag_coefficient = 2e-4    # [m s⁻¹]
+quadratic_drag_coefficient = 2e-3 # dimensionless
+
 println(stderr, "Using bottom drag: ", drag_type)
+if drag_type == LinearDrag
+    println(stderr, "Linear drag coefficient: ", linear_drag_coefficient, " m s⁻¹")
+elseif drag_type == QuadraticDrag
+    println(stderr, "Quadratic drag coefficient: ", quadratic_drag_coefficient)
+else
+    println(stderr, "Bottom drag is disabled")
+end
 flush(stderr)
 
 underlying_grid = LatitudeLongitudeGrid(arch;
@@ -86,7 +98,8 @@ parameters = (Lφ = Lφ,
               Lz = Lz,
               φ₀ = φ₀,           # latitude of the center of the domain [°]
                τ = 0.1 / ρ₀,     # surface kinematic wind stress [m² s⁻²]
-               μ = 0.001,        # bottom drag damping parameter [m s⁻¹]
+        linear_drag = linear_drag_coefficient,
+     quadratic_drag = quadratic_drag_coefficient,
       drag_type = drag_type,     # NoDrag, LinearDrag, or QuadraticDrag
      λ_slope_width = 7.5,        # west/east sidewall width [°]
      φ_slope_width = 7.5,        # south/north sidewall width [°]
@@ -152,14 +165,14 @@ save("SurfaceWindStress.pdf", fig)
 =#
 
 # ### Bottom drag
-# Linear drag: -μ * u
-# Quadratic drag: -μ * |u| * u (sign-preserving)
+# Linear drag: -r * u, where r has units of m s⁻¹
+# Quadratic drag: -Cᴅ * |u| * u, where Cᴅ is dimensionless
 # No drag: zero momentum flux
 @inline function drag_flux(velocity, p)
     if p.drag_type == QuadraticDrag
-        return -p.μ * abs(velocity) * velocity
+        return -p.quadratic_drag * abs(velocity) * velocity
     elseif p.drag_type == LinearDrag
-        return -p.μ * velocity
+        return -p.linear_drag * velocity
     else
         return zero(velocity)
     end
@@ -183,6 +196,22 @@ end
 @inline function v_immersed_drag(i, j, k, grid, clock, model_fields, p)
     v = @inbounds model_fields.v[i, j, k]
     return drag_flux(v, p)
+end
+
+# Bottom-stress diagnostics on the native u and v grids. Values are zero away
+# from active velocity nodes immediately above the regular or immersed bottom.
+@inline function bottom_stress_u(i, j, k, grid, u, p)
+    active = !inactive_node(i, j, k, grid, Face(), Center(), Center())
+    above_bottom = k == 1 || inactive_node(i, j, k - 1, grid, Face(), Center(), Center())
+    stress = drag_flux(@inbounds(u[i, j, k]), p)
+    return ifelse(active & above_bottom, stress, zero(grid))
+end
+
+@inline function bottom_stress_v(i, j, k, grid, v, p)
+    active = !inactive_node(i, j, k, grid, Center(), Face(), Center())
+    above_bottom = k == 1 || inactive_node(i, j, k - 1, grid, Center(), Face(), Center())
+    stress = drag_flux(@inbounds(v[i, j, k]), p)
+    return ifelse(active & above_bottom, stress, zero(grid))
 end
 
 u_drag_bc = FluxBoundaryCondition(u_drag, discrete_form=true, parameters=parameters)
@@ -270,13 +299,21 @@ simulation.output_writers[:fields] = JLD2Writer(model, outputs,
                                                 indices = (:, :, model.grid.Nz),
                                                 overwrite_existing = true)
 
-barotropic_u = Field(Average(model.velocities.u, dims = 3))
-barotropic_v = Field(Average(model.velocities.v, dims = 3))
+bottom_stress_u_operation = KernelFunctionOperation{Face, Center, Center}(bottom_stress_u, grid, u, parameters)
+bottom_stress_v_operation = KernelFunctionOperation{Center, Face, Center}(bottom_stress_v, grid, v, parameters)
+bottom_stress_u_field = Field(bottom_stress_u_operation)
+bottom_stress_v_field = Field(bottom_stress_v_operation)
 
-simulation.output_writers[:barotropic_velocities] =
-    JLD2Writer(model, (u = barotropic_u, v = barotropic_v),
-               schedule = AveragedTimeInterval(30days, window = 10days),
-               filename = "double_gyre_circulation",
+monthly_outputs = (u = u,
+                   v = v,
+                   b = b,
+                   bottom_stress_u = bottom_stress_u_field,
+                   bottom_stress_v = bottom_stress_v_field)
+
+simulation.output_writers[:monthly_means] =
+    JLD2Writer(model, monthly_outputs,
+               schedule = AveragedTimeInterval(model_month, window = model_month),
+               filename = "double_gyre_monthly_mean",
                overwrite_existing = true)
 
 run!(simulation)
@@ -339,12 +376,12 @@ CairoMakie.record(fig, filename[1:end-5] * ".mp4", frames, framerate = 8) do i
 end
 
 
-# Plot the barotropic circulation
+# Plot the barotropic circulation derived from the monthly-mean 3D fields
 
-filename_barotropic = "double_gyre_circulation.jld2"
+filename_monthly_mean = "double_gyre_monthly_mean.jld2"
 
-U_timeseries = FieldTimeSeries(filename_barotropic, "u"; grid, architecture = CPU())
-V_timeseries = FieldTimeSeries(filename_barotropic, "v"; grid, architecture = CPU())
+U_timeseries = FieldTimeSeries(filename_monthly_mean, "u"; grid, architecture = CPU())
+V_timeseries = FieldTimeSeries(filename_monthly_mean, "v"; grid, architecture = CPU())
 
 # time-average; adjust accordingly to avoid spinup
 U_mean = Field{Oceananigans.Fields.location(U_timeseries)...}(on_architecture(CPU(), grid))
@@ -355,19 +392,24 @@ for (iter, time_snapshop) in enumerate(round(Int, length(U_timeseries)/2):length
     parent(V_mean) .= parent(V_mean) * (iter - 1) / iter .+ parent(V_timeseries[time_snapshop]) / iter
 end
 
+U_barotropic_mean = Field(Average(U_mean, dims = 3))
+V_barotropic_mean = Field(Average(V_mean, dims = 3))
+compute!(U_barotropic_mean)
+compute!(V_barotropic_mean)
+
 fig = Figure(size = (1650, 1250))
 
 title_U = "Depth- and Time-Averaged Zonal Velocity"
 ax_U = Axis(fig[1:2, 1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
-hm_U = heatmap!(ax_U, λᵤ, φᵤ, U_mean; colorrange = ulims ./10, colormap = :balance)
+hm_U = heatmap!(ax_U, λᵤ, φᵤ, U_barotropic_mean; colorrange = ulims ./10, colormap = :balance)
 Colorbar(fig[1:2, 2], hm_U)
 
 title_V = "Depth- and Time-Averaged Meridional Velocity"
 ax_V = Axis(fig[3:4, 1]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Degree)")
-hm_V = heatmap!(ax_V, λᵥ, φᵥ, V_mean; colorrange = vlims ./10, colormap = :balance)
+hm_V = heatmap!(ax_V, λᵥ, φᵥ, V_barotropic_mean; colorrange = vlims ./10, colormap = :balance)
 Colorbar(fig[3:4, 2], hm_V)
 
-Ψ = CumulativeIntegral(- U_mean, dims = 2) |> Field
+Ψ = CumulativeIntegral(-U_barotropic_mean, dims = 2) |> Field
 Ψlims = extrema(Ψ) .* extrema_reduction_factor
 
 title_Ψ = "Barotropic Streamfunction"
