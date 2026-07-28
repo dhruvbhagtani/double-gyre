@@ -12,7 +12,7 @@ using Printf
 
 # Architecture: CPU() or GPU(); the latter requires using CUDA package
 using CUDA
-arch = CPU()
+arch = GPU()
 
 const λ_west = -30 # [°] longitude of west boundary
 const λ_east = +30 # [°] longitude of east boundary
@@ -35,8 +35,21 @@ Nφ = Integer(Lφ * resolution)
 Nz = 35
 use_sloping_sidewalls = true
 
-# bottom drag type: :linear or :quadratic
-drag_type = :linear
+# Bottom drag type, selected at submission with DRAG_TYPE=linear, quadratic, or none.
+# The UInt8-backed enum is safe to pass as a parameter to GPU kernels.
+@enum DragType::UInt8 NoDrag LinearDrag QuadraticDrag
+
+function parse_drag_type(value)
+    name = lowercase(strip(value))
+    name == "none"      && return NoDrag
+    name == "linear"    && return LinearDrag
+    name == "quadratic" && return QuadraticDrag
+    throw(ArgumentError("Invalid DRAG_TYPE=$(repr(value)); expected linear, quadratic, or none"))
+end
+
+drag_type = parse_drag_type(get(ENV, "DRAG_TYPE", "linear"))
+println(stderr, "Using bottom drag: ", drag_type)
+flush(stderr)
 
 underlying_grid = LatitudeLongitudeGrid(arch;
                                         size = (Nλ, Nφ, Nz),
@@ -67,19 +80,20 @@ cᵖ = 3991 # [J K⁻¹ kg⁻¹] heat capacity for seawater
 ρ₀ = 1028 # [kg m⁻³] reference seawater density
 
 Δzₛ = minimum_zspacing(underlying_grid) # vertical spacing at the surface [m]
+buoyancy_restoring_timescale = 30days
 
 parameters = (Lφ = Lφ,
               Lz = Lz,
               φ₀ = φ₀,           # latitude of the center of the domain [°]
                τ = 0.1 / ρ₀,     # surface kinematic wind stress [m² s⁻²]
                μ = 0.001,        # bottom drag damping parameter [m s⁻¹]
-      drag_type = drag_type,    # :linear or :quadratic
+      drag_type = drag_type,     # NoDrag, LinearDrag, or QuadraticDrag
      λ_slope_width = 7.5,        # west/east sidewall width [°]
      φ_slope_width = 7.5,        # south/north sidewall width [°]
     slope_sharpness = 3.5,       # nondimensional steepness of tanh sidewall transition
               Δb = 30 * α * g,   # surface vertical buoyancy gradient [s⁻²]
-       timescale = 30days,       # relaxation time scale [s]
-              vˢ = Δzₛ / 30days) # buoyancy pumping velocity [m s⁻¹]
+       timescale = buoyancy_restoring_timescale,       # relaxation time scale [s]
+              vˢ = Δzₛ / buoyancy_restoring_timescale) # buoyancy pumping velocity [m s⁻¹]
 
 function sidewall_bathymetry(λ, φ, p)
     ξx = clamp(min((λ - λ_west) / p.λ_slope_width,
@@ -111,7 +125,7 @@ end
 @inline function buoyancy_relaxation(i, j, grid, clock, model_fields, p)
     b = @inbounds model_fields.b[i, j, grid.Nz] # surface b
     φ = φnode(j, grid, Center())
-    return - 1 / p.timescale * (b - surface_buoyancy(φ, p))
+    return -p.vˢ * (b - surface_buoyancy(φ, p))
 end
 
 # ### Plotting surface forcing functions
@@ -140,40 +154,35 @@ save("SurfaceWindStress.pdf", fig)
 # ### Bottom drag
 # Linear drag: -μ * u
 # Quadratic drag: -μ * |u| * u (sign-preserving)
+# No drag: zero momentum flux
+@inline function drag_flux(velocity, p)
+    if p.drag_type == QuadraticDrag
+        return -p.μ * abs(velocity) * velocity
+    elseif p.drag_type == LinearDrag
+        return -p.μ * velocity
+    else
+        return zero(velocity)
+    end
+end
+
 @inline function u_drag(i, j, grid, clock, model_fields, p)
     u = @inbounds model_fields.u[i, j, 1]
-    if p.drag_type == :quadratic
-        return - p.μ * abs(u) * u
-    else  # linear
-        return - p.μ * u
-    end
+    return drag_flux(u, p)
 end
 
 @inline function v_drag(i, j, grid, clock, model_fields, p)
     v = @inbounds model_fields.v[i, j, 1]
-    if p.drag_type == :quadratic
-        return - p.μ * abs(v) * v
-    else  # linear
-        return - p.μ * v
-    end
+    return drag_flux(v, p)
 end
 
 @inline function u_immersed_drag(i, j, k, grid, clock, model_fields, p)
     u = @inbounds model_fields.u[i, j, k]
-    if p.drag_type == :quadratic
-        return - p.μ * abs(u) * u
-    else  # linear
-        return - p.μ * u
-    end
+    return drag_flux(u, p)
 end
 
 @inline function v_immersed_drag(i, j, k, grid, clock, model_fields, p)
     v = @inbounds model_fields.v[i, j, k]
-    if p.drag_type == :quadratic
-        return - p.μ * abs(v) * v
-    else  # linear
-        return - p.μ * v
-    end
+    return drag_flux(v, p)
 end
 
 u_drag_bc = FluxBoundaryCondition(u_drag, discrete_form=true, parameters=parameters)
@@ -226,15 +235,18 @@ simulation = Simulation(model; Δt, stop_time)
 wall_clock = [time_ns()]
 
 function progress(sim)
-    @info @sprintf("[%05.2f%%] i: %d, t: %s, max(u): (%6.2e, %6.2e, %6.2e) m s⁻¹, Δt: %s, wall time: %s\n",
-            100 * (sim.model.clock.time / sim.stop_time),
-            sim.model.clock.iteration,
-            prettytime(sim.model.clock.time),
-            maximum(abs, sim.model.velocities.u),
-            maximum(abs, sim.model.velocities.v),
-            maximum(abs, sim.model.velocities.w),
-            prettytime(sim.Δt),
-            prettytime(1e-9 * (time_ns() - wall_clock[1])))
+    message = @sprintf("[%05.2f%%] i: %d, t: %s, max(u): (%6.2e, %6.2e, %6.2e) m s⁻¹, Δt: %s, wall time: %s",
+                       100 * (sim.model.clock.time / sim.stop_time),
+                       sim.model.clock.iteration,
+                       prettytime(sim.model.clock.time),
+                       maximum(abs, sim.model.velocities.u),
+                       maximum(abs, sim.model.velocities.v),
+                       maximum(abs, sim.model.velocities.w),
+                       prettytime(sim.Δt),
+                       prettytime(1e-9 * (time_ns() - wall_clock[1])))
+
+    println(stderr, message)
+    flush(stderr)
 
     wall_clock[1] = time_ns()
 
