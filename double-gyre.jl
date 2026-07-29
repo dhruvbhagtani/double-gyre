@@ -5,6 +5,7 @@ using Oceananigans.Units
 using Oceananigans.Grids: φnode, inactive_node
 using Oceananigans.Architectures: on_architecture
 using Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid, ImmersedBoundaryCondition, PartialCellBottom
+using Oceananigans.Operators: ℑxyᶠᶜᵃ, ℑxyᶜᶠᵃ
 
 using CairoMakie
 using Statistics
@@ -23,6 +24,7 @@ const φ₀ = (φ_south + φ_north) / 2 # [°] latitude of the center of the dom
 const Lλ = λ_east - λ_west   # [°] longitude extent of the domain
 const Lφ = φ_north - φ_south # [°] latitude extent of the domain
 const Lz = 2kilometers # depth [m]
+const coastal_depth = 200meters # minimum water depth at every lateral boundary [m]
 
 # timestep and final time
 Δt = 30minutes # adjust depending on chosen resolution; 30min seems OK with 1/4 deg resolution + RK3 timestep
@@ -71,8 +73,6 @@ underlying_grid = LatitudeLongitudeGrid(arch;
                                         topology = (Bounded, Bounded, Bounded),
                                         halo = (7, 7, 4))
 
-@inline tanh_ramp(ξ, sharpness) = (tanh(sharpness * (ξ - 0.5)) + tanh(sharpness / 2)) / (2 * tanh(sharpness / 2))
-
 # We can plot vertical spacing versus depth to inspect the prescribed grid stretching.
 
 #=
@@ -103,21 +103,29 @@ parameters = (Lφ = Lφ,
       drag_type = drag_type,     # NoDrag, LinearDrag, or QuadraticDrag
      λ_slope_width = 7.5,        # west/east sidewall width [°]
      φ_slope_width = 7.5,        # south/north sidewall width [°]
-    slope_sharpness = 3.5,       # nondimensional steepness of tanh sidewall transition
+   coastal_depth = coastal_depth,
               Δb = 30 * α * g,   # surface vertical buoyancy gradient [s⁻²]
        timescale = buoyancy_restoring_timescale,       # relaxation time scale [s]
               vˢ = Δzₛ / buoyancy_restoring_timescale) # buoyancy pumping velocity [m s⁻¹]
 
-function sidewall_bathymetry(λ, φ, p)
-    ξx = clamp(min((λ - λ_west) / p.λ_slope_width,
-                   (λ_east - λ) / p.λ_slope_width), 0, 1)
-    ξy = clamp(min((φ - φ_south) / p.φ_slope_width,
-                   (φ_north - φ) / p.φ_slope_width), 0, 1)
+@inline quintic_smoothstep(ξ) = ξ^3 * (10 + ξ * (-15 + 6ξ))
 
-    # Use the normalized distance to the nearest lateral wall so that the
-    # bathymetry rises to z = 0 along all four boundaries.
-    ξ = min(ξx, ξy)
-    return -p.Lz * tanh_ramp(ξ, p.slope_sharpness)
+@inline function wall_factor(distance, width)
+    ξ = clamp(distance / width, 0, 1)
+    return quintic_smoothstep(ξ)
+end
+
+@inline function sidewall_bathymetry(λ, φ, p)
+    west  = wall_factor(λ - λ_west,  p.λ_slope_width)
+    east  = wall_factor(λ_east - λ,  p.λ_slope_width)
+    south = wall_factor(φ - φ_south, p.φ_slope_width)
+    north = wall_factor(φ_north - φ, p.φ_slope_width)
+
+    # Multiplication blends adjacent wall slopes without the diagonal corner
+    # creases produced by a hard minimum. The quintic factors have zero first
+    # and second derivatives where they meet both the coast and flat bottom.
+    interior_factor = west * east * south * north
+    return -p.coastal_depth - (p.Lz - p.coastal_depth) * interior_factor
 end
 
 if use_sloping_sidewalls
@@ -168,56 +176,53 @@ save("SurfaceWindStress.pdf", fig)
 # Linear drag: -r * u, where r has units of m s⁻¹
 # Quadratic drag: -Cᴅ * |u| * u, where Cᴅ is dimensionless
 # No drag: zero momentum flux
-@inline function drag_flux(velocity, p)
+@inline function drag_flux(component, speed, p)
     if p.drag_type == QuadraticDrag
-        return -p.quadratic_drag * abs(velocity) * velocity
+        return -p.quadratic_drag * speed * component
     elseif p.drag_type == LinearDrag
-        return -p.linear_drag * velocity
+        return -p.linear_drag * component
     else
-        return zero(velocity)
+        return zero(component)
     end
 end
 
-@inline function u_drag(i, j, grid, clock, model_fields, p)
-    u = @inbounds model_fields.u[i, j, 1]
-    return drag_flux(u, p)
-end
+@inline horizontal_speed(u, v) = sqrt(u^2 + v^2)
 
-@inline function v_drag(i, j, grid, clock, model_fields, p)
-    v = @inbounds model_fields.v[i, j, 1]
-    return drag_flux(v, p)
-end
+# Oceananigans interpolates the field dependencies to the location of each
+# staggered stress component before calling these continuous boundary
+# functions. The first pair is used at the regular bottom and the second pair
+# at immersed-bottom faces, where the vertical coordinate is also supplied.
+@inline u_drag(λ, φ, t, u, v, p) = drag_flux(u, horizontal_speed(u, v), p)
+@inline v_drag(λ, φ, t, u, v, p) = drag_flux(v, horizontal_speed(u, v), p)
 
-@inline function u_immersed_drag(i, j, k, grid, clock, model_fields, p)
-    u = @inbounds model_fields.u[i, j, k]
-    return drag_flux(u, p)
-end
-
-@inline function v_immersed_drag(i, j, k, grid, clock, model_fields, p)
-    v = @inbounds model_fields.v[i, j, k]
-    return drag_flux(v, p)
-end
+@inline u_immersed_drag(λ, φ, z, t, u, v, p) = drag_flux(u, horizontal_speed(u, v), p)
+@inline v_immersed_drag(λ, φ, z, t, u, v, p) = drag_flux(v, horizontal_speed(u, v), p)
 
 # Bottom-stress diagnostics on the native u and v grids. Values are zero away
 # from active velocity nodes immediately above the regular or immersed bottom.
-@inline function bottom_stress_u(i, j, k, grid, u, p)
+@inline function bottom_stress_u(i, j, k, grid, u, v, p)
     active = !inactive_node(i, j, k, grid, Face(), Center(), Center())
     above_bottom = k == 1 || inactive_node(i, j, k - 1, grid, Face(), Center(), Center())
-    stress = drag_flux(@inbounds(u[i, j, k]), p)
+    uᵢ = @inbounds u[i, j, k]
+    vᵢ = ℑxyᶠᶜᵃ(i, j, k, grid, v)
+    stress = drag_flux(uᵢ, horizontal_speed(uᵢ, vᵢ), p)
     return ifelse(active & above_bottom, stress, zero(grid))
 end
 
-@inline function bottom_stress_v(i, j, k, grid, v, p)
+@inline function bottom_stress_v(i, j, k, grid, u, v, p)
     active = !inactive_node(i, j, k, grid, Center(), Face(), Center())
     above_bottom = k == 1 || inactive_node(i, j, k - 1, grid, Center(), Face(), Center())
-    stress = drag_flux(@inbounds(v[i, j, k]), p)
+    uᵢ = ℑxyᶜᶠᵃ(i, j, k, grid, u)
+    vᵢ = @inbounds v[i, j, k]
+    stress = drag_flux(vᵢ, horizontal_speed(uᵢ, vᵢ), p)
     return ifelse(active & above_bottom, stress, zero(grid))
 end
 
-u_drag_bc = FluxBoundaryCondition(u_drag, discrete_form=true, parameters=parameters)
-v_drag_bc = FluxBoundaryCondition(v_drag, discrete_form=true, parameters=parameters)
-u_immersed_drag_bc = FluxBoundaryCondition(u_immersed_drag, discrete_form=true, parameters=parameters)
-v_immersed_drag_bc = FluxBoundaryCondition(v_immersed_drag, discrete_form=true, parameters=parameters)
+drag_dependencies = (:u, :v)
+u_drag_bc = FluxBoundaryCondition(u_drag; field_dependencies=drag_dependencies, parameters)
+v_drag_bc = FluxBoundaryCondition(v_drag; field_dependencies=drag_dependencies, parameters)
+u_immersed_drag_bc = FluxBoundaryCondition(u_immersed_drag; field_dependencies=drag_dependencies, parameters)
+v_immersed_drag_bc = FluxBoundaryCondition(v_immersed_drag; field_dependencies=drag_dependencies, parameters)
 
 u_stress_bc = FluxBoundaryCondition(u_stress; parameters)
 b_relax_bc  = FluxBoundaryCondition(buoyancy_relaxation, discrete_form=true, parameters=parameters)
@@ -299,8 +304,8 @@ simulation.output_writers[:fields] = JLD2Writer(model, outputs,
                                                 indices = (:, :, model.grid.Nz),
                                                 overwrite_existing = true)
 
-bottom_stress_u_operation = KernelFunctionOperation{Face, Center, Center}(bottom_stress_u, grid, u, parameters)
-bottom_stress_v_operation = KernelFunctionOperation{Center, Face, Center}(bottom_stress_v, grid, v, parameters)
+bottom_stress_u_operation = KernelFunctionOperation{Face, Center, Center}(bottom_stress_u, grid, u, v, parameters)
+bottom_stress_v_operation = KernelFunctionOperation{Center, Face, Center}(bottom_stress_v, grid, u, v, parameters)
 bottom_stress_u_field = Field(bottom_stress_u_operation)
 bottom_stress_v_field = Field(bottom_stress_v_operation)
 
