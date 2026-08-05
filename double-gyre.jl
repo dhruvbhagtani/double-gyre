@@ -5,7 +5,7 @@ using Oceananigans.Units
 using Oceananigans.Grids: φnode, inactive_node
 using Oceananigans.Architectures: on_architecture
 using Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid, ImmersedBoundaryCondition, PartialCellBottom
-using Oceananigans.Operators: ℑxyᶠᶜᵃ, ℑxyᶜᶠᵃ
+using Oceananigans.Operators: ℑxyᶠᶜᵃ, ℑxyᶜᶠᵃ, Δx, Δy
 
 using CairoMakie
 using Statistics
@@ -24,7 +24,7 @@ const φ₀ = (φ_south + φ_north) / 2 # [°] latitude of the center of the dom
 const Lλ = λ_east - λ_west   # [°] longitude extent of the domain
 const Lφ = φ_north - φ_south # [°] latitude extent of the domain
 const Lz = 2kilometers # depth [m]
-const coastal_depth = 200meters # minimum water depth at every lateral boundary [m]
+const coastal_depth = 500meters # minimum water depth at every lateral boundary [m]
 
 # timestep and final time
 Δt = 30minutes # adjust depending on chosen resolution; 30min seems OK with 1/4 deg resolution + RK3 timestep
@@ -37,7 +37,24 @@ resolution = 4 # corresponds to 1/resolution in degrees
 Nλ = Integer(Lλ * resolution)
 Nφ = Integer(Lφ * resolution)
 Nz = 35
-use_sloping_sidewalls = true
+
+# Bathymetry configuration, selected at submission with
+# SLOPE_CONFIG=all, zonal, west, or none. The default keeps slopes only at
+# the western and eastern boundaries.
+@enum SlopeConfig::UInt8 NoSlopes WesternSlope ZonalSlopes AllSlopes
+
+function parse_slope_config(value)
+    name = lowercase(strip(value))
+    name in ("none", "flat")                           && return NoSlopes
+    name in ("west", "western")                        && return WesternSlope
+    name in ("zonal", "east-west", "eastwest", "two") && return ZonalSlopes
+    name in ("all", "four")                            && return AllSlopes
+    throw(ArgumentError("Invalid SLOPE_CONFIG=$(repr(value)); expected all, zonal, west, or none"))
+end
+
+slope_config = parse_slope_config(get(ENV, "SLOPE_CONFIG", "zonal"))
+println(stderr, "Using slope configuration: ", slope_config)
+flush(stderr)
 
 # Bottom drag type, selected at submission with DRAG_TYPE=linear, quadratic, or none.
 # The UInt8-backed enum is safe to pass as a parameter to GPU kernels.
@@ -51,7 +68,7 @@ function parse_drag_type(value)
     throw(ArgumentError("Invalid DRAG_TYPE=$(repr(value)); expected linear, quadratic, or none"))
 end
 
-drag_type = parse_drag_type(get(ENV, "DRAG_TYPE", "linear"))
+drag_type = parse_drag_type(get(ENV, "DRAG_TYPE", "quadratic"))
 linear_drag_coefficient = 2e-4    # [m s⁻¹]
 quadratic_drag_coefficient = 2e-3 # dimensionless
 
@@ -97,13 +114,14 @@ buoyancy_restoring_timescale = 30days
 parameters = (Lφ = Lφ,
               Lz = Lz,
               φ₀ = φ₀,           # latitude of the center of the domain [°]
-               τ = 0.1 / ρ₀,     # surface kinematic wind stress [m² s⁻²]
+               τ = 0.05 / ρ₀,    # surface kinematic wind stress [m² s⁻²]
         linear_drag = linear_drag_coefficient,
      quadratic_drag = quadratic_drag_coefficient,
       drag_type = drag_type,     # NoDrag, LinearDrag, or QuadraticDrag
      λ_slope_width = 7.5,        # west/east sidewall width [°]
      φ_slope_width = 7.5,        # south/north sidewall width [°]
    coastal_depth = coastal_depth,
+      slope_config = slope_config,
               Δb = 30 * α * g,   # surface vertical buoyancy gradient [s⁻²]
        timescale = buoyancy_restoring_timescale,       # relaxation time scale [s]
               vˢ = Δzₛ / buoyancy_restoring_timescale) # buoyancy pumping velocity [m s⁻¹]
@@ -124,11 +142,18 @@ end
     # Multiplication blends adjacent wall slopes without the diagonal corner
     # creases produced by a hard minimum. The quintic factors have zero first
     # and second derivatives where they meet both the coast and flat bottom.
-    interior_factor = west * east * south * north
+    interior_factor = if p.slope_config == AllSlopes
+        west * east * south * north
+    elseif p.slope_config == ZonalSlopes
+        west * east
+    else # WesternSlope
+        west
+    end
+
     return -p.coastal_depth - (p.Lz - p.coastal_depth) * interior_factor
 end
 
-if use_sloping_sidewalls
+if slope_config != NoSlopes
     immersed_boundary = PartialCellBottom((λ, φ) -> sidewall_bathymetry(λ, φ, parameters);
                                           minimum_fractional_cell_height = 0.2)
     grid = ImmersedBoundaryGrid(underlying_grid, immersed_boundary)
@@ -146,7 +171,8 @@ end
 @inline function buoyancy_relaxation(i, j, grid, clock, model_fields, p)
     b = @inbounds model_fields.b[i, j, grid.Nz] # surface b
     φ = φnode(j, grid, Center())
-    return -p.vˢ * (b - surface_buoyancy(φ, p))
+    # Oceananigans applies a top flux Qᵇ as ∂ₜ b = -Qᵇ / Δz.
+    return p.vˢ * (b - surface_buoyancy(φ, p))
 end
 
 # ### Plotting surface forcing functions
@@ -188,15 +214,35 @@ end
 
 @inline horizontal_speed(u, v) = sqrt(u^2 + v^2)
 
-# Oceananigans interpolates the field dependencies to the location of each
-# staggered stress component before calling these continuous boundary
-# functions. The first pair is used at the regular bottom and the second pair
-# at immersed-bottom faces, where the vertical coordinate is also supplied.
-@inline u_drag(λ, φ, t, u, v, p) = drag_flux(u, horizontal_speed(u, v), p)
-@inline v_drag(λ, φ, t, u, v, p) = drag_flux(v, horizontal_speed(u, v), p)
+# Evaluate drag in discrete form so field access and interpolation remain
+# statically resolvable when these functions are compiled for the GPU. Since
+# u and v are staggered, interpolate the cross-component to the native location
+# of the component whose bottom flux is being computed.
+@inline function u_drag(i, j, grid, clock, model_fields, p)
+    k = 1
+    uᵢ = @inbounds model_fields.u[i, j, k]
+    vᵢ = ℑxyᶠᶜᵃ(i, j, k, grid, model_fields.v)
+    return drag_flux(uᵢ, horizontal_speed(uᵢ, vᵢ), p)
+end
 
-@inline u_immersed_drag(λ, φ, z, t, u, v, p) = drag_flux(u, horizontal_speed(u, v), p)
-@inline v_immersed_drag(λ, φ, z, t, u, v, p) = drag_flux(v, horizontal_speed(u, v), p)
+@inline function v_drag(i, j, grid, clock, model_fields, p)
+    k = 1
+    uᵢ = ℑxyᶜᶠᵃ(i, j, k, grid, model_fields.u)
+    vᵢ = @inbounds model_fields.v[i, j, k]
+    return drag_flux(vᵢ, horizontal_speed(uᵢ, vᵢ), p)
+end
+
+@inline function u_immersed_drag(i, j, k, grid, clock, model_fields, p)
+    uᵢ = @inbounds model_fields.u[i, j, k]
+    vᵢ = ℑxyᶠᶜᵃ(i, j, k, grid, model_fields.v)
+    return drag_flux(uᵢ, horizontal_speed(uᵢ, vᵢ), p)
+end
+
+@inline function v_immersed_drag(i, j, k, grid, clock, model_fields, p)
+    uᵢ = ℑxyᶜᶠᵃ(i, j, k, grid, model_fields.u)
+    vᵢ = @inbounds model_fields.v[i, j, k]
+    return drag_flux(vᵢ, horizontal_speed(uᵢ, vᵢ), p)
+end
 
 # Bottom-stress diagnostics on the native u and v grids. Values are zero away
 # from active velocity nodes immediately above the regular or immersed bottom.
@@ -218,16 +264,15 @@ end
     return ifelse(active & above_bottom, stress, zero(grid))
 end
 
-drag_dependencies = (:u, :v)
-u_drag_bc = FluxBoundaryCondition(u_drag; field_dependencies=drag_dependencies, parameters)
-v_drag_bc = FluxBoundaryCondition(v_drag; field_dependencies=drag_dependencies, parameters)
-u_immersed_drag_bc = FluxBoundaryCondition(u_immersed_drag; field_dependencies=drag_dependencies, parameters)
-v_immersed_drag_bc = FluxBoundaryCondition(v_immersed_drag; field_dependencies=drag_dependencies, parameters)
+u_drag_bc = FluxBoundaryCondition(u_drag, discrete_form=true, parameters=parameters)
+v_drag_bc = FluxBoundaryCondition(v_drag, discrete_form=true, parameters=parameters)
+u_immersed_drag_bc = FluxBoundaryCondition(u_immersed_drag, discrete_form=true, parameters=parameters)
+v_immersed_drag_bc = FluxBoundaryCondition(v_immersed_drag, discrete_form=true, parameters=parameters)
 
 u_stress_bc = FluxBoundaryCondition(u_stress; parameters)
 b_relax_bc  = FluxBoundaryCondition(buoyancy_relaxation, discrete_form=true, parameters=parameters)
 
-if use_sloping_sidewalls
+if slope_config != NoSlopes
     u_immersed_bcs = ImmersedBoundaryCondition(bottom = u_immersed_drag_bc)
     v_immersed_bcs = ImmersedBoundaryCondition(bottom = v_immersed_drag_bc)
 
@@ -240,10 +285,28 @@ end
 b_bcs = FieldBoundaryConditions(top = b_relax_bc)
 
 # ## Turbulence closure
-boundary_layer_closure     = RiBasedVerticalDiffusivity()
-vertical_diffusive_closure = VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(), κ = 3e-5, ν = 5e-4)
+boundary_layer_closure       = RiBasedVerticalDiffusivity()
+vertical_diffusive_closure   = VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(), κ = 3e-5, ν = 5e-4)
+const biharmonic_damping_timescale = 5days
 
-closures = (boundary_layer_closure, vertical_diffusive_closure)
+@inline function horizontal_grid_scale_squared(i, j, k, grid, ℓx, ℓy, ℓz)
+    Δx² = Δx(i, j, k, grid, ℓx, ℓy, ℓz)^2
+    Δy² = Δy(i, j, k, grid, ℓx, ℓy, ℓz)^2
+    return inv(inv(Δx²) + inv(Δy²))
+end
+
+@inline function grid_scale_biharmonic_viscosity(i, j, k, grid, ℓx, ℓy, ℓz, clock, model_fields)
+    Δh² = horizontal_grid_scale_squared(i, j, k, grid, ℓx, ℓy, ℓz)
+    return Δh²^2 / biharmonic_damping_timescale
+end
+
+horizontal_biharmonic_closure =
+    HorizontalScalarBiharmonicDiffusivity(ν = grid_scale_biharmonic_viscosity,
+                                          discrete_form = true)
+
+closures = (boundary_layer_closure,
+            vertical_diffusive_closure,
+            horizontal_biharmonic_closure)
 
 # ## Model building
 model = HydrostaticFreeSurfaceModel(; grid,
@@ -265,11 +328,18 @@ set!(model, b = bᵢ)
 # ## Simulation setup
 simulation = Simulation(model; Δt, stop_time)
 
+wizard = TimeStepWizard(cfl = 0.5,
+                        max_change = 1.05,
+                        min_change = 0.0,
+                        max_Δt = 30minutes)
+
+simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(2))
+
 # add progress callback
 wall_clock = [time_ns()]
 
 function progress(sim)
-    message = @sprintf("[%05.2f%%] i: %d, t: %s, max(u): (%6.2e, %6.2e, %6.2e) m s⁻¹, Δt: %s, wall time: %s",
+    message = @sprintf("[%05.2f%%] i: %d, t: %s, max(u): (%6.2e, %6.2e, %6.2e) m s⁻¹, Δt: %s, CFL: %.2f, wall time: %s",
                        100 * (sim.model.clock.time / sim.stop_time),
                        sim.model.clock.iteration,
                        prettytime(sim.model.clock.time),
@@ -277,6 +347,7 @@ function progress(sim)
                        maximum(abs, sim.model.velocities.v),
                        maximum(abs, sim.model.velocities.w),
                        prettytime(sim.Δt),
+                       AdvectiveCFL(sim.Δt)(sim.model),
                        prettytime(1e-9 * (time_ns() - wall_clock[1])))
 
     println(stderr, message)
