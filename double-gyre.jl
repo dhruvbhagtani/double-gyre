@@ -5,9 +5,10 @@ using Oceananigans.Units
 using Oceananigans.Grids: φnode, inactive_node
 using Oceananigans.Architectures: on_architecture
 using Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid, ImmersedBoundaryCondition, PartialCellBottom
-using Oceananigans.Operators: ℑxyᶠᶜᵃ, ℑxyᶜᶠᵃ, Δx, Δy
+using Oceananigans.Operators: ℑxyᶠᶜᵃ, ℑxyᶜᶠᵃ, Δx, Δy, Δz, Ax, Ay, Az, volume
 
 using CairoMakie
+using JLD2
 using Statistics
 using Printf
 
@@ -29,8 +30,7 @@ const coastal_depth = 500meters # minimum water depth at every lateral boundary 
 # timestep and final time
 Δt = 30minutes # adjust depending on chosen resolution; 30min seems OK with 1/4 deg resolution + RK3 timestep
 model_year = 365days
-model_month = model_year / 12
-stop_time = 20 * model_year
+stop_time = model_year
 
 # resolution
 resolution = 4 # corresponds to 1/resolution in degrees
@@ -264,6 +264,25 @@ end
     return ifelse(active & above_bottom, stress, zero(grid))
 end
 
+# Collapse the three-dimensional bottom-stress diagnostics onto their native
+# horizontal grids. Each wet column has one active velocity node immediately
+# above the regular or immersed bottom; all other levels contribute zero.
+@inline function bottom_stress_u_map(i, j, k, grid, u, v, p)
+    stress = zero(grid)
+    for k = 1:grid.Nz
+        stress += bottom_stress_u(i, j, k, grid, u, v, p)
+    end
+    return stress
+end
+
+@inline function bottom_stress_v_map(i, j, k, grid, u, v, p)
+    stress = zero(grid)
+    for k = 1:grid.Nz
+        stress += bottom_stress_v(i, j, k, grid, u, v, p)
+    end
+    return stress
+end
+
 u_drag_bc = FluxBoundaryCondition(u_drag, discrete_form=true, parameters=parameters)
 v_drag_bc = FluxBoundaryCondition(v_drag, discrete_form=true, parameters=parameters)
 u_immersed_drag_bc = FluxBoundaryCondition(u_immersed_drag, discrete_form=true, parameters=parameters)
@@ -320,6 +339,199 @@ model = HydrostaticFreeSurfaceModel(; grid,
                                     tracers  = :b, # if boundary_layer_closure = RiBasedVerticalDiffusivity()
                                     # tracers  = (:b, :e), # if boundary_layer_closure = CATKEVerticalDiffusivity()
                                     boundary_conditions = (u = u_bcs, v = v_bcs, b = b_bcs))
+# ## Static grid and forcing data
+
+@inline function zonal_wind_stress(i, j, k, grid, p)
+    φ = φnode(j, grid, Center())
+    return u_stress(0, φ, 0, p)
+end
+
+@inline meridional_wind_stress(i, j, k, grid, p) = zero(grid)
+
+@inline function coriolis_frequency(i, j, k, grid, coriolis)
+    φ = φnode(j, grid, Center())
+    return 2 * coriolis.rotation_rate * sind(φ)
+end
+
+@inline function wet_mask(i, j, k, grid, ℓx, ℓy, ℓz)
+    return !inactive_node(i, j, k, grid, ℓx, ℓy, ℓz)
+end
+
+@inline function masked_metric(i, j, k, grid, metric, ℓx, ℓy, ℓz)
+    wet = wet_mask(i, j, k, grid, ℓx, ℓy, ℓz)
+    return ifelse(wet, metric(i, j, k, grid, ℓx, ℓy, ℓz), zero(grid))
+end
+
+@inline function bottom_index(i, j, k, grid, ℓx, ℓy, ℓz)
+    bottom = 0
+    for level = 1:grid.Nz
+        active = wet_mask(i, j, level, grid, ℓx, ℓy, ℓz)
+        above_bottom = level == 1 || inactive_node(i, j, level - 1, grid, ℓx, ℓy, ℓz)
+        bottom = ifelse(active & above_bottom, level, bottom)
+    end
+    return bottom
+end
+
+function computed_interior(field)
+    compute!(field)
+    return Array(interior(field))
+end
+
+function write_static_fields(filename, model, parameters)
+    grid = model.grid
+
+    τx = Field(KernelFunctionOperation{Face, Center, Nothing}(zonal_wind_stress, grid, parameters))
+    τy = Field(KernelFunctionOperation{Center, Face, Nothing}(meridional_wind_stress, grid, parameters))
+    f  = Field(KernelFunctionOperation{Center, Center, Nothing}(coriolis_frequency, grid, model.coriolis))
+
+    Δx_tracer = Field(xspacings(grid, Center(), Center(), nothing))
+    Δy_tracer = Field(yspacings(grid, Center(), Center(), nothing))
+    Δx_u = Field(xspacings(grid, Face(), Center(), nothing))
+    Δy_u = Field(yspacings(grid, Face(), Center(), nothing))
+    Δx_v = Field(xspacings(grid, Center(), Face(), nothing))
+    Δy_v = Field(yspacings(grid, Center(), Face(), nothing))
+
+    mask_tracer = Field(KernelFunctionOperation{Center, Center, Center}(wet_mask, grid, Center(), Center(), Center()))
+    mask_u = Field(KernelFunctionOperation{Face, Center, Center}(wet_mask, grid, Face(), Center(), Center()))
+    mask_v = Field(KernelFunctionOperation{Center, Face, Center}(wet_mask, grid, Center(), Face(), Center()))
+    mask_w = Field(KernelFunctionOperation{Center, Center, Face}(wet_mask, grid, Center(), Center(), Face()))
+
+    Δz_tracer = Field(KernelFunctionOperation{Center, Center, Center}(masked_metric, grid, Δz, Center(), Center(), Center()))
+    Δz_u = Field(KernelFunctionOperation{Face, Center, Center}(masked_metric, grid, Δz, Face(), Center(), Center()))
+    Δz_w = Field(KernelFunctionOperation{Center, Center, Face}(masked_metric, grid, Δz, Center(), Center(), Face()))
+    Δz_v = Field(KernelFunctionOperation{Center, Face, Center}(masked_metric, grid, Δz, Center(), Face(), Center()))
+
+    horizontal_area_tracer = Field(KernelFunctionOperation{Center, Center, Nothing}(Az, grid, Center(), Center(), nothing))
+    horizontal_area_u = Field(KernelFunctionOperation{Face, Center, Nothing}(Az, grid, Face(), Center(), nothing))
+    horizontal_area_v = Field(KernelFunctionOperation{Center, Face, Nothing}(Az, grid, Center(), Face(), nothing))
+    horizontal_area_w = horizontal_area_tracer
+    x_face_area_u = Field(KernelFunctionOperation{Face, Center, Center}(masked_metric, grid, Ax, Face(), Center(), Center()))
+    y_face_area_v = Field(KernelFunctionOperation{Center, Face, Center}(masked_metric, grid, Ay, Center(), Face(), Center()))
+    z_face_area_w = Field(KernelFunctionOperation{Center, Center, Face}(masked_metric, grid, Az, Center(), Center(), Face()))
+
+    volume_tracer = Field(KernelFunctionOperation{Center, Center, Center}(masked_metric, grid, volume, Center(), Center(), Center()))
+    volume_u = Field(KernelFunctionOperation{Face, Center, Center}(masked_metric, grid, volume, Face(), Center(), Center()))
+    volume_v = Field(KernelFunctionOperation{Center, Face, Center}(masked_metric, grid, volume, Center(), Face(), Center()))
+    volume_w = Field(KernelFunctionOperation{Center, Center, Face}(masked_metric, grid, volume, Center(), Center(), Face()))
+
+    bottom_index_tracer = Field(KernelFunctionOperation{Center, Center, Nothing}(bottom_index, grid, Center(), Center(), Center()))
+    bottom_index_u = Field(KernelFunctionOperation{Face, Center, Nothing}(bottom_index, grid, Face(), Center(), Center()))
+    bottom_index_v = Field(KernelFunctionOperation{Center, Face, Nothing}(bottom_index, grid, Center(), Face(), Center()))
+    bottom_index_w = Field(KernelFunctionOperation{Center, Center, Nothing}(bottom_index, grid, Center(), Center(), Face()))
+
+    bathymetry = if grid isa ImmersedBoundaryGrid
+        grid.immersed_boundary.bottom_height
+    else
+        flat_bottom = Field{Center, Center, Nothing}(grid)
+        set!(flat_bottom, -parameters.Lz)
+        flat_bottom
+    end
+
+    λc, φc, _ = nodes(grid, Center(), Center(), nothing)
+    λf, _,  _ = nodes(grid, Face(),   Center(), nothing)
+    _,  φf, _ = nodes(grid, Center(), Face(),   nothing)
+
+    tracer_deltax = computed_interior(Δx_tracer)
+    tracer_deltay = computed_interior(Δy_tracer)
+
+    JLD2.jldopen(filename, "w") do file
+        file["tau_x"] = computed_interior(τx)
+        file["tau_y"] = computed_interior(τy)
+        file["deltax_tracer"] = tracer_deltax
+        file["deltay_tracer"] = tracer_deltay
+        file["deltax_u"] = computed_interior(Δx_u)
+        file["deltay_u"] = computed_interior(Δy_u)
+        file["deltax_v"] = computed_interior(Δx_v)
+        file["deltay_v"] = computed_interior(Δy_v)
+        # The w grid has the same horizontal staggering as the tracer grid.
+        file["deltax_w"] = tracer_deltax
+        file["deltay_w"] = tracer_deltay
+        file["bathymetry"] = computed_interior(bathymetry)
+        file["f"] = computed_interior(f)
+
+        file["wet_mask_tracer"] = UInt8.(computed_interior(mask_tracer))
+        file["wet_mask_u"] = UInt8.(computed_interior(mask_u))
+        file["wet_mask_v"] = UInt8.(computed_interior(mask_v))
+        file["wet_mask_w"] = UInt8.(computed_interior(mask_w))
+
+        file["effective_dz_tracer"] = computed_interior(Δz_tracer)
+        file["effective_dz_u"] = computed_interior(Δz_u)
+        file["effective_dz_v"] = computed_interior(Δz_v)
+        file["effective_dz_w"] = computed_interior(Δz_w)
+
+        file["horizontal_area_tracer"] = computed_interior(horizontal_area_tracer)
+        file["horizontal_area_u"] = computed_interior(horizontal_area_u)
+        file["horizontal_area_v"] = computed_interior(horizontal_area_v)
+        file["horizontal_area_w"] = computed_interior(horizontal_area_w)
+        file["x_face_area_u"] = computed_interior(x_face_area_u)
+        file["y_face_area_v"] = computed_interior(y_face_area_v)
+        file["z_face_area_w"] = computed_interior(z_face_area_w)
+
+        file["cell_volume_tracer"] = computed_interior(volume_tracer)
+        file["cell_volume_u"] = computed_interior(volume_u)
+        file["cell_volume_v"] = computed_interior(volume_v)
+        file["cell_volume_w"] = computed_interior(volume_w)
+
+        file["bottom_index_tracer"] = Int32.(computed_interior(bottom_index_tracer))
+        file["bottom_index_u"] = Int32.(computed_interior(bottom_index_u))
+        file["bottom_index_v"] = Int32.(computed_interior(bottom_index_v))
+        file["bottom_index_w"] = Int32.(computed_interior(bottom_index_w))
+
+        file["coordinates/longitude_center"] = Array(λc)
+        file["coordinates/longitude_face"] = Array(λf)
+        file["coordinates/latitude_center"] = Array(φc)
+        file["coordinates/latitude_face"] = Array(φf)
+        file["coordinates/z_center"] = Array(znodes(grid, Center(), Center(), Center()))
+        file["coordinates/z_face"] = Array(znodes(grid, Center(), Center(), Face()))
+
+        file["metadata/tau_x_units"] = "m² s⁻²"
+        file["metadata/tau_y_units"] = "m² s⁻²"
+        file["metadata/grid_spacing_units"] = "m"
+        file["metadata/bathymetry_units"] = "m"
+        file["metadata/f_units"] = "s⁻¹"
+        file["metadata/tau_x_location"] = "Face, Center"
+        file["metadata/tau_y_location"] = "Center, Face"
+        file["metadata/tracer_and_w_location"] = "Center, Center"
+        file["metadata/u_location"] = "Face, Center"
+        file["metadata/v_location"] = "Center, Face"
+        file["metadata/bathymetry_location"] = "Center, Center"
+        file["metadata/f_location"] = "Center, Center"
+
+        file["metadata/effective_dz_units"] = "m"
+        file["metadata/area_units"] = "m²"
+        file["metadata/cell_volume_units"] = "m³"
+        file["metadata/wet_mask_convention"] = "UInt8: 1 = active node, 0 = inactive node"
+        file["metadata/masked_metric_convention"] = "effective_dz, face areas, and cell volumes are zero at inactive nodes"
+        file["metadata/bottom_index_convention"] = "Int32: 1-based k index of lowest active node; 0 = no active node"
+        file["metadata/minimum_fractional_cell_height"] = grid isa ImmersedBoundaryGrid ? grid.immersed_boundary.minimum_fractional_cell_height : 1
+
+        file["metadata/effective_dz_tracer_location"] = "Center, Center, Center"
+        file["metadata/effective_dz_u_location"] = "Face, Center, Center"
+        file["metadata/effective_dz_v_location"] = "Center, Face, Center"
+        file["metadata/effective_dz_w_location"] = "Center, Center, Face"
+        file["metadata/horizontal_area_tracer_location"] = "Center, Center"
+        file["metadata/horizontal_area_u_location"] = "Face, Center"
+        file["metadata/horizontal_area_v_location"] = "Center, Face"
+        file["metadata/horizontal_area_w_location"] = "Center, Center"
+        file["metadata/x_face_area_u_location"] = "Face, Center, Center"
+        file["metadata/y_face_area_v_location"] = "Center, Face, Center"
+        file["metadata/z_face_area_w_location"] = "Center, Center, Face"
+        file["metadata/cell_volume_tracer_location"] = "Center, Center, Center"
+        file["metadata/cell_volume_u_location"] = "Face, Center, Center"
+        file["metadata/cell_volume_v_location"] = "Center, Face, Center"
+        file["metadata/cell_volume_w_location"] = "Center, Center, Face"
+        file["metadata/bottom_index_tracer_location"] = "Center, Center"
+        file["metadata/bottom_index_u_location"] = "Face, Center"
+        file["metadata/bottom_index_v_location"] = "Center, Face"
+        file["metadata/bottom_index_w_location"] = "Center, Center (vertical Face index)"
+
+        file["metadata/bathymetry_sign_convention"] = "z coordinate; negative below the surface"
+    end
+
+    return nothing
+end
+
+write_static_fields("double_gyre_static.jld2", model, parameters)
 
 # ## Initial conditions
 bᵢ(λ, φ, z) = parameters.Δb * z / grid.Lz
@@ -375,21 +587,35 @@ simulation.output_writers[:fields] = JLD2Writer(model, outputs,
                                                 indices = (:, :, model.grid.Nz),
                                                 overwrite_existing = true)
 
-bottom_stress_u_operation = KernelFunctionOperation{Face, Center, Center}(bottom_stress_u, grid, u, v, parameters)
-bottom_stress_v_operation = KernelFunctionOperation{Center, Face, Center}(bottom_stress_v, grid, u, v, parameters)
+bottom_stress_u_operation = KernelFunctionOperation{Face, Center, Nothing}(bottom_stress_u_map, grid, u, v, parameters)
+bottom_stress_v_operation = KernelFunctionOperation{Center, Face, Nothing}(bottom_stress_v_map, grid, u, v, parameters)
 bottom_stress_u_field = Field(bottom_stress_u_operation)
 bottom_stress_v_field = Field(bottom_stress_v_operation)
 
-monthly_outputs = (u = u,
-                   v = v,
-                   b = b,
-                   bottom_stress_u = bottom_stress_u_field,
-                   bottom_stress_v = bottom_stress_v_field)
+stratification = Field(∂z(b))
 
-simulation.output_writers[:monthly_means] =
-    JLD2Writer(model, monthly_outputs,
-               schedule = AveragedTimeInterval(model_month, window = model_month),
-               filename = "double_gyre_monthly_mean",
+@inline function surface_buoyancy_forcing(i, j, k, grid, b, p)
+    surface_b = @inbounds b[i, j, grid.Nz]
+    φ = φnode(j, grid, Center())
+    return p.vˢ * (surface_b - surface_buoyancy(φ, p))
+end
+
+surface_buoyancy_forcing_operation =
+    KernelFunctionOperation{Center, Center, Nothing}(surface_buoyancy_forcing, grid, b, parameters)
+surface_buoyancy_forcing_field = Field(surface_buoyancy_forcing_operation)
+
+yearly_outputs = (u = u,
+                  v = v,
+                  b = b,
+                  bottom_stress_u = bottom_stress_u_field,
+                  bottom_stress_v = bottom_stress_v_field,
+                  N_2 = stratification,
+                  surface_buoyancy_forcing = surface_buoyancy_forcing_field)
+
+simulation.output_writers[:yearly_means] =
+    JLD2Writer(model, yearly_outputs,
+               schedule = AveragedTimeInterval(model_year, window = model_year),
+               filename = "double_gyre_yearly_mean",
                overwrite_existing = true)
 
 run!(simulation)
@@ -452,12 +678,12 @@ CairoMakie.record(fig, filename[1:end-5] * ".mp4", frames, framerate = 8) do i
 end
 
 
-# Plot the barotropic circulation derived from the monthly-mean 3D fields
+# Plot the barotropic circulation derived from the yearly-mean 3D fields
 
-filename_monthly_mean = "double_gyre_monthly_mean.jld2"
+filename_yearly_mean = "double_gyre_yearly_mean.jld2"
 
-U_timeseries = FieldTimeSeries(filename_monthly_mean, "u"; grid, architecture = CPU())
-V_timeseries = FieldTimeSeries(filename_monthly_mean, "v"; grid, architecture = CPU())
+U_timeseries = FieldTimeSeries(filename_yearly_mean, "u"; grid, architecture = CPU())
+V_timeseries = FieldTimeSeries(filename_yearly_mean, "v"; grid, architecture = CPU())
 
 # time-average; adjust accordingly to avoid spinup
 U_mean = Field{Oceananigans.Fields.location(U_timeseries)...}(on_architecture(CPU(), grid))
