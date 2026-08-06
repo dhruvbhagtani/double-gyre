@@ -30,7 +30,7 @@ const coastal_depth = 500meters # minimum water depth at every lateral boundary 
 Δt = 30minutes # adjust depending on chosen resolution; 30min seems OK with 1/4 deg resolution + RK3 timestep
 model_year = 365days
 model_month = model_year / 12
-stop_time = 20 * model_year
+stop_time = 1 * model_year
 
 # resolution
 resolution = 4 # corresponds to 1/resolution in degrees
@@ -361,6 +361,9 @@ end
 simulation.callbacks[:progress] = Callback(progress, TimeInterval(7days))
 
 # ## Output
+
+include(joinpath(@__DIR__, "vorticity_budget_diagnostics.jl"))
+
 u, v, w = model.velocities
 b = model.tracers.b
 
@@ -390,6 +393,26 @@ simulation.output_writers[:monthly_means] =
     JLD2Writer(model, monthly_outputs,
                schedule = AveragedTimeInterval(model_month, window = model_month),
                filename = "double_gyre_monthly_mean",
+               overwrite_existing = true)
+
+budget_outputs = barotropic_budget_outputs(model, parameters)
+
+simulation.output_writers[:barotropic_budget] =
+    JLD2Writer(model, budget_outputs,
+               schedule = AveragedTimeInterval(model_month,
+                                               window = model_month,
+                                               stride = 1),
+               filename = "double_gyre_barotropic_budget",
+               array_type = Array{Float64},
+               overwrite_existing = true)
+
+budget_state_outputs = barotropic_budget_state_outputs(model)
+
+simulation.output_writers[:barotropic_budget_state] =
+    JLD2Writer(model, budget_state_outputs,
+               schedule = TimeInterval(model_month),
+               filename = "double_gyre_barotropic_budget_state",
+               array_type = Array{Float64},
                overwrite_existing = true)
 
 run!(simulation)
