@@ -110,6 +110,7 @@ cᵖ = 3991 # [J K⁻¹ kg⁻¹] heat capacity for seawater
 
 Δzₛ = minimum_zspacing(underlying_grid) # vertical spacing at the surface [m]
 buoyancy_restoring_timescale = 30days
+ΔT = 30 # °C
 
 parameters = (Lφ = Lφ,
               Lz = Lz,
@@ -122,7 +123,7 @@ parameters = (Lφ = Lφ,
      φ_slope_width = 7.5,        # south/north sidewall width [°]
    coastal_depth = coastal_depth,
       slope_config = slope_config,
-              Δb = 30 * α * g,   # surface vertical buoyancy gradient [s⁻²]
+              Δb = ΔT * α * g,   # surface vertical buoyancy gradient [s⁻²]
        timescale = buoyancy_restoring_timescale,       # relaxation time scale [s]
               vˢ = Δzₛ / buoyancy_restoring_timescale) # buoyancy pumping velocity [m s⁻¹]
 
