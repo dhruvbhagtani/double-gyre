@@ -7,7 +7,7 @@ vorticity budget by applying Oceananigans' native, metric-aware C-grid curl.
 Usage
 -----
 
-    julia --project=. convert_barotropic_vorticity_budget.jl \
+    julia --project=. generate_vorticity_budget/convert_barotropic_vorticity_budget.jl \
         [momentum_budget.jld2] [budget_state.jld2] [output.jld2] \
         [--time-resolution=yearly|monthly] [--force]
 
@@ -67,10 +67,12 @@ using Oceananigans.Operators: ζ₃ᶠᶠᶜ, ℑxᶠᵃᵃ, ℑxyᶠᶠᵃ
 using JLD2
 using Printf
 
-const DEFAULT_BUDGET = "double_gyre_barotropic_budget.jld2"
-const DEFAULT_STATE  = "double_gyre_barotropic_budget_state.jld2"
-const DEFAULT_OUTPUT = "double_gyre_barotropic_vorticity_budget.jld2"
-const DEFAULT_MONTHLY_OUTPUT = "double_gyre_barotropic_vorticity_budget_monthly.jld2"
+const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
+const OUTPUT_DIR = joinpath(PROJECT_ROOT, "outputs")
+const DEFAULT_BUDGET = joinpath(OUTPUT_DIR, "double_gyre_barotropic_budget.jld2")
+const DEFAULT_STATE  = joinpath(OUTPUT_DIR, "double_gyre_barotropic_budget_state.jld2")
+const DEFAULT_OUTPUT = joinpath(OUTPUT_DIR, "double_gyre_barotropic_vorticity_budget.jld2")
+const DEFAULT_MONTHLY_OUTPUT = joinpath(OUTPUT_DIR, "double_gyre_barotropic_vorticity_budget_monthly.jld2")
 const MODEL_YEAR = 365 * 86400.0
 
 const SOURCE_PAIRS = (
@@ -379,7 +381,7 @@ function main()
                 record = last(records)
                 iteration = iterations[record]
                 time = times[record]
-                comparison_rhs = haskey(curls, :closed_rhs) ? curls[:closed_rhs] : curls[:full_rhs]
+                comparison_rhs = curls[:full_rhs]
                 full_rhs_by_iteration[iteration] = comparison_rhs
                 curls_by_iteration[iteration] = curls
 
@@ -412,7 +414,7 @@ function main()
                 state = load_series(args.state, ["transport_u", "transport_v", "free_surface"], state_iterations)
                 write_description!(output, "transport_vorticity", "Curl of the instantaneous depth-integrated transport", units="m s⁻¹")
                 write_description!(output, "transport_vorticity_tendency", "Finite-difference transport-vorticity tendency over the preceding averaging interval")
-                comparison_name = any(first(pair) == :closed_rhs for pair in active_pairs) ? "closed_rhs" : "full_rhs"
+                comparison_name = "full_rhs"
                 write_description!(output, "tendency_closure_residual", "transport_vorticity_tendency - $comparison_name")
 
                 install_field_metadata!(output, "transport_vorticity", template_field)
@@ -430,7 +432,7 @@ function main()
                     write_description!(output, "beta_V", "β (Khatri et al. 2024 Eq. 3) times the vertically integrated meridional transport, interpolated to the vorticity point")
                     write_description!(output, "eta_tendency_term", "f ∂tη, the free-surface tendency term in Khatri et al. (2024) Eq. 3")
                     write_description!(output, "bottom_pressure_torque", "J(pb,H)/ρo, diagnosed as coriolis + pressure + beta_V - eta_tendency_term following Khatri et al. (2024) Eq. B4; assumes Qm=0")
-                    write_description!(output, "khatri_budget_residual", "beta_V - (bottom_pressure_torque + wind_stress + bottom_drag + advection + closure + eta_tendency_term - full_rhs); validates Khatri et al. (2024) Eq. 3 closure")
+                    write_description!(output, "khatri_budget_residual", "beta_V - (bottom_pressure_torque + wind_stress + bottom_drag + advection + closure + eta_tendency_term - transport_vorticity_tendency); validates Khatri et al. (2024) Eq. 3 closure")
                     install_field_metadata!(output, "beta_V", template_field)
                     install_field_metadata!(output, "eta_tendency_term", template_field)
                     install_field_metadata!(output, "bottom_pressure_torque", template_field)
@@ -485,7 +487,7 @@ function main()
                             write_record!(output, "bottom_pressure_torque", iteration, bottom_pressure_torque)
 
                             khatri_rhs = (bottom_pressure_torque .+ record_curls[:wind_stress] .+ record_curls[:bottom_drag] .+
-                                         record_curls[:advection] .+ record_curls[:closure] .+ eta_tendency_term .- record_curls[:full_rhs])
+                                         record_curls[:advection] .+ record_curls[:closure] .+ eta_tendency_term .- tendency)
                             khatri_budget_residual = beta_V .- khatri_rhs
                             write_record!(output, "khatri_budget_residual", iteration, khatri_budget_residual)
                         end
@@ -507,4 +509,4 @@ function main()
     return nothing
 end
 
-main()
+abspath(PROGRAM_FILE) == (@__FILE__) && main()

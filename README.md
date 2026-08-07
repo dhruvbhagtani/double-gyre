@@ -1,6 +1,21 @@
 # double-gyre
 Double gyre simulations with Oceananigans
 
+### Worktree layout
+
+This worktree keeps restart state, generated diagnostics, scheduler logs, and
+vorticity-budget tooling separate:
+
+```text
+checkpoints/                  Restart checkpoints used by RUN_MODE=resume
+outputs/                      Generated JLD2, PNG, PDF, and MP4 diagnostics
+logs/                         Slurm standard-output and standard-error logs
+generate_vorticity_budget/    Vorticity-budget generation code
+├── vorticity_budget_diagnostics.jl
+└── convert_barotropic_vorticity_budget.jl
+```
+
+Run submission and analysis commands from the root of this worktree.
 
 ### Instructions
 
@@ -29,7 +44,7 @@ Now you are ready to run the main script!
 For instance,
 
 ```julia
-julia> include("double-gyre.jl")
+julia> ENV["RUN_MODE"] = "fresh"; ENV["STOP_YEARS"] = "1"; include("double-gyre.jl")
 ```
 
 ### Running and restarting with Slurm
@@ -56,45 +71,56 @@ legacy `PICKUP` variable is no longer supported. A resume also fails early if
 the checkpoint does not exist or its saved model time already equals or exceeds
 the requested `STOP_YEARS`.
 
-### Discrete barotropic-vorticity budget
+### Barotropic-vorticity budget
 
-The GPU submission script runs the model with an online, discrete
-depth-integrated transport budget:
+The GPU submission script runs the model with an online, depth-integrated
+momentum budget:
 
 ```bash
-sbatch run_double_gyre_gpu.sh
+sbatch --export=ALL,RUN_MODE=fresh,STOP_YEARS=1 run_double_gyre_gpu.sh
 ```
 
-`double_gyre_barotropic_budget.jld2` contains the stage-used physical slow
-terms, the exact step-to-step transport tendency, the slow forcing actually
-used by the split-explicit solver, and the effective split-explicit pressure
-contribution. The two principal checks are
+`outputs/double_gyre_barotropic_budget.jld2` contains 32 fields: 18 stage-used
+physical fields plus 14 discrete split-solver audit fields. The physical fields
+are the zonal and meridional components of advection, Coriolis, pressure,
+closure, immersed stress, total tendency, regular-bottom drag,
+immersed-bottom drag, and surface flux. The discrete fields verify
 
 ```text
 solver_slow = component_rhs + slow_decomposition_residual
 transport_tendency = solver_slow + split_explicit_pressure
+closure_residual = transport_tendency - closed_rhs
 ```
 
-and `closure_residual = transport_tendency - closed_rhs` should be near roundoff.
+The companion state file stores the barotropic transports and free surface at
+monthly endpoints. The offline converter also computes the independent
+physical closure residual
+
+```text
+transport_vorticity_tendency - full_rhs
+```
+
+where the transport-vorticity tendency comes from consecutive transport
+snapshots and `full_rhs` comes from the curled physical momentum terms.
 
 After the run, convert every vector term to its native spherical C-grid curl.
 The default output is a time-weighted yearly mean:
 
 ```bash
-julia --project=. --startup-file=no convert_barotropic_vorticity_budget.jl --force
+julia --project=. --startup-file=no generate_vorticity_budget/convert_barotropic_vorticity_budget.jl --force
 ```
 
-This writes `double_gyre_barotropic_vorticity_budget.jld2`, with one record at
-the end of each model year. To retain the source monthly records instead, use:
+This writes `outputs/double_gyre_barotropic_vorticity_budget.jld2`, with one
+record at the end of each model year. To retain the source monthly records instead, use:
 
 ```bash
-julia --project=. --startup-file=no convert_barotropic_vorticity_budget.jl \
+julia --project=. --startup-file=no generate_vorticity_budget/convert_barotropic_vorticity_budget.jl \
     --time-resolution=monthly --force
 ```
 
 Monthly output is written to
-`double_gyre_barotropic_vorticity_budget_monthly.jld2`. Its day-zero tendency
-is initialization output and should not be included in averages.
+`outputs/double_gyre_barotropic_vorticity_budget_monthly.jld2`. Its day-zero
+tendency is initialization output and should not be included in averages.
 
 When the state file is present, the output also includes `beta_V`,
 `eta_tendency_term`, and `bottom_pressure_torque`, matching the barotropic

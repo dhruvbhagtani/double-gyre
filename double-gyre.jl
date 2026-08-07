@@ -12,6 +12,11 @@ using JLD2
 using Statistics
 using Printf
 
+const OUTPUT_DIR = joinpath(@__DIR__, "outputs")
+const CHECKPOINT_DIR = joinpath(@__DIR__, "checkpoints")
+mkpath(OUTPUT_DIR)
+mkpath(CHECKPOINT_DIR)
+
 # Architecture: CPU() or GPU(); the latter requires using CUDA package
 using CUDA
 
@@ -171,7 +176,7 @@ ax = Axis(fig[1, 1],
           title = "Variation of Vertical Spacing with Depth")
 scatterlines!(ax, grid.z.Δᵃᵃᶠ[1:Nz+1], grid.z.cᵃᵃᶠ[1:Nz+1])
 
-save("double_gyre_grid_spacing.pdf", fig)
+save(joinpath(OUTPUT_DIR, "double_gyre_grid_spacing.pdf"), fig)
 =#
 
 g  = Oceananigans.defaults.gravitational_acceleration
@@ -257,7 +262,7 @@ ax  = Axis(fig[1, 1],
            title = "Surface Buoyancy Forcing")
 scatterlines!(ax, surface_buoyancy.(φ, Ref(parameters)), φ)
 
-save("SurfaceBuoyancyForcing.pdf", fig)
+save(joinpath(OUTPUT_DIR, "SurfaceBuoyancyForcing.pdf"), fig)
 
 
 fig = Figure()
@@ -267,7 +272,7 @@ ax = Axis(fig[1, 1],
           title = "Surface Wind Stress")
 scatterlines!(ax, u_stress.(0, φ, 0, Ref(parameters)), φ)
 
-save("SurfaceWindStress.pdf", fig)
+save(joinpath(OUTPUT_DIR, "SurfaceWindStress.pdf"), fig)
 =#
 
 # ### Bottom drag
@@ -603,7 +608,7 @@ function write_static_fields(filename, model, parameters)
     return nothing
 end
 
-write_static_fields("double_gyre_static.jld2", model, parameters)
+write_static_fields(joinpath(OUTPUT_DIR, "double_gyre_static.jld2"), model, parameters)
 
 # ## Initial conditions
 bᵢ(λ, φ, z) = parameters.Δb * z / grid.Lz
@@ -646,7 +651,7 @@ simulation.callbacks[:progress] = Callback(progress, TimeInterval(7days))
 
 # ## Output
 
-include(joinpath(@__DIR__, "vorticity_budget_diagnostics.jl"))
+include(joinpath(@__DIR__, "generate_vorticity_budget", "vorticity_budget_diagnostics.jl"))
 
 u, v, w = model.velocities
 b = model.tracers.b
@@ -658,7 +663,7 @@ outputs = merge(model.velocities, model.tracers, (speed = speed, b² = buoyancy_
 
 simulation.output_writers[:fields] = JLD2Writer(model, outputs,
                                                 schedule = TimeInterval(7days),
-                                                filename = "double_gyre",
+                                                filename = joinpath(OUTPUT_DIR, "double_gyre"),
                                                 indices = (:, :, model.grid.Nz),
                                                 overwrite_existing = !restarting)
 
@@ -668,7 +673,7 @@ simulation.output_writers[:fields] = JLD2Writer(model, outputs,
 simulation.output_writers[:checkpointer] =
     Checkpointer(model;
                  schedule = TimeInterval(model_year),
-                 dir = "checkpoints",
+                 dir = CHECKPOINT_DIR,
                  prefix = "double_gyre",
                  overwrite_existing = false,
                  cleanup = false,
@@ -702,7 +707,7 @@ yearly_outputs = (u = u,
 simulation.output_writers[:yearly_means] =
     JLD2Writer(model, yearly_outputs,
                schedule = AveragedTimeInterval(model_year, window = model_year),
-               filename = "double_gyre_yearly_mean",
+               filename = joinpath(OUTPUT_DIR, "double_gyre_yearly_mean"),
                overwrite_existing = !restarting)
 
 discrete_transport_budget = discrete_barotropic_transport_budget(model, parameters)
@@ -728,7 +733,7 @@ simulation.output_writers[:barotropic_budget] =
                schedule = AveragedTimeInterval(model_month,
                                                window = model_month,
                                                stride = 1),
-               filename = "double_gyre_barotropic_budget",
+               filename = joinpath(OUTPUT_DIR, "double_gyre_barotropic_budget"),
                array_type = Array{Float64},
                overwrite_existing = true)
 
@@ -737,7 +742,7 @@ budget_state_outputs = barotropic_budget_state_outputs(model)
 simulation.output_writers[:barotropic_budget_state] =
     JLD2Writer(model, budget_state_outputs,
                schedule = TimeInterval(model_month),
-               filename = "double_gyre_barotropic_budget_state",
+               filename = joinpath(OUTPUT_DIR, "double_gyre_barotropic_budget_state"),
                array_type = Array{Float64},
                overwrite_existing = true)
 
@@ -748,7 +753,7 @@ run!(simulation; pickup)
 
 # We open the JLD2 file, and extract the `grid` and the iterations we ended up saving at.
 
-filename = "double_gyre.jld2"
+filename = joinpath(OUTPUT_DIR, "double_gyre.jld2")
 u_timeseries = FieldTimeSeries(filename, "u"; architecture = CPU())
 v_timeseries = FieldTimeSeries(filename, "v"; architecture = CPU())
 s_timeseries = FieldTimeSeries(filename, "speed"; architecture = CPU())
@@ -794,7 +799,7 @@ Colorbar(fig[2:3, 4], hm_s; label = "Speed (m s⁻¹)")
 
 frames = 1:length(times)
 
-CairoMakie.record(fig, filename[1:end-5] * ".mp4", frames, framerate = 8) do i
+CairoMakie.record(fig, joinpath(OUTPUT_DIR, "double_gyre.mp4"), frames, framerate = 8) do i
     msg = string("Plotting frame ", i, " of ", frames[end])
     print(msg * " \r")
     n[] = i
@@ -803,7 +808,7 @@ end
 
 # Plot the barotropic circulation derived from the yearly-mean 3D fields
 
-filename_yearly_mean = "double_gyre_yearly_mean.jld2"
+filename_yearly_mean = joinpath(OUTPUT_DIR, "double_gyre_yearly_mean.jld2")
 
 U_timeseries = FieldTimeSeries(filename_yearly_mean, "u"; grid, architecture = CPU())
 V_timeseries = FieldTimeSeries(filename_yearly_mean, "v"; grid, architecture = CPU())
@@ -842,4 +847,4 @@ ax_Ψ = Axis(fig[2:3, 3]; xlabel = "Longitude (Degree)", ylabel = "Latitude (Deg
 hm_Ψ = heatmap!(ax_Ψ, λᵤ, φᵤ, Ψ; colorrange = Ψlims, colormap = :balance)
 Colorbar(fig[2:3, 4], hm_Ψ)
 
-save("double_gyre_circulation.png", fig)
+save(joinpath(OUTPUT_DIR, "double_gyre_circulation.png"), fig)
