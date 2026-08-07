@@ -14,7 +14,6 @@ using Printf
 
 # Architecture: CPU() or GPU(); the latter requires using CUDA package
 using CUDA
-arch = GPU()
 
 const λ_west = -30 # [°] longitude of west boundary
 const λ_east = +30 # [°] longitude of east boundary
@@ -27,10 +26,81 @@ const Lφ = φ_north - φ_south # [°] latitude extent of the domain
 const Lz = 2kilometers # depth [m]
 const coastal_depth = 500meters # minimum water depth at every lateral boundary [m]
 
-# timestep and final time
+# Timestep and final time. RUN_MODE must be either "fresh" or "resume".
+# Resume runs also require CHECKPOINT to name a specific checkpoint file.
+# STOP_YEARS is the absolute final model time, not the length of this job.
 Δt = 30minutes # adjust depending on chosen resolution; 30min seems OK with 1/4 deg resolution + RK3 timestep
 model_year = 365days
-stop_time = model_year
+
+function parse_stop_years(value)
+    years = try
+        parse(Float64, strip(value))
+    catch
+        throw(ArgumentError("Invalid STOP_YEARS=$(repr(value)); expected a positive number"))
+    end
+
+    isfinite(years) && years > 0 ||
+        throw(ArgumentError("Invalid STOP_YEARS=$(repr(value)); expected a positive finite number"))
+
+    return years
+end
+
+stop_years = parse_stop_years(get(ENV, "STOP_YEARS", "1"))
+stop_time = stop_years * model_year
+
+function restart_configuration(stop_time, stop_years)
+    haskey(ENV, "PICKUP") &&
+        throw(ArgumentError("PICKUP is no longer supported; set RUN_MODE=fresh, or set RUN_MODE=resume and CHECKPOINT=/path/to/checkpoint.jld2"))
+
+    run_mode = lowercase(strip(get(ENV, "RUN_MODE", "")))
+    run_mode in ("fresh", "resume") ||
+        throw(ArgumentError("RUN_MODE is required and must be either fresh or resume"))
+
+    checkpoint_setting = strip(get(ENV, "CHECKPOINT", ""))
+
+    if run_mode == "fresh"
+        isempty(checkpoint_setting) ||
+            throw(ArgumentError("CHECKPOINT must be unset when RUN_MODE=fresh"))
+        return false, false
+    end
+
+    isempty(checkpoint_setting) &&
+        throw(ArgumentError("CHECKPOINT is required when RUN_MODE=resume and must name a specific checkpoint file"))
+
+    checkpoint = abspath(checkpoint_setting)
+    isfile(checkpoint) || throw(ArgumentError("Checkpoint file does not exist: $checkpoint"))
+
+    saved_clock = try
+        jldopen(checkpoint, "r") do file
+            file["HydrostaticFreeSurfaceModel/clock"]
+        end
+    catch exception
+        throw(ArgumentError("Could not read the model clock from checkpoint $checkpoint: $(sprint(showerror, exception))"))
+    end
+
+    saved_time = saved_clock.time
+    saved_iteration = saved_clock.iteration
+    saved_time < stop_time ||
+        throw(ArgumentError("Checkpoint is already at $(prettytime(saved_time)) (iteration $saved_iteration), which equals or exceeds the requested final time $(prettytime(stop_time)); increase STOP_YEARS"))
+
+    println(stderr, "Run mode: resume")
+    println(stderr, "Checkpoint: $checkpoint")
+    println(stderr, "Checkpoint state: iteration $saved_iteration, model time $(prettytime(saved_time))")
+    println(stderr, "Requested final model time: $(prettytime(stop_time)) (STOP_YEARS=$stop_years)")
+    flush(stderr)
+
+    return checkpoint, true
+end
+
+pickup, restarting = restart_configuration(stop_time, stop_years)
+
+if !restarting
+    println(stderr, "Run mode: fresh")
+    println(stderr, "Requested final model time: $(prettytime(stop_time)) (STOP_YEARS=$stop_years)")
+    flush(stderr)
+end
+
+arch = GPU()
 
 # resolution
 resolution = 4 # corresponds to 1/resolution in degrees
@@ -586,7 +656,19 @@ simulation.output_writers[:fields] = JLD2Writer(model, outputs,
                                                 schedule = TimeInterval(7days),
                                                 filename = "double_gyre",
                                                 indices = (:, :, model.grid.Nz),
-                                                overwrite_existing = true)
+                                                overwrite_existing = !restarting)
+
+# Save the full prognostic and time-stepping state every simulated model year.
+# These files can be supplied to a subsequent job via RUN_MODE=resume and an
+# explicit CHECKPOINT path.
+simulation.output_writers[:checkpointer] =
+    Checkpointer(model;
+                 schedule = TimeInterval(model_year),
+                 dir = "checkpoints",
+                 prefix = "double_gyre",
+                 overwrite_existing = false,
+                 cleanup = false,
+                 verbose = true)
 
 bottom_stress_u_operation = KernelFunctionOperation{Face, Center, Nothing}(bottom_stress_u_map, grid, u, v, parameters)
 bottom_stress_v_operation = KernelFunctionOperation{Center, Face, Nothing}(bottom_stress_v_map, grid, u, v, parameters)
@@ -617,9 +699,9 @@ simulation.output_writers[:yearly_means] =
     JLD2Writer(model, yearly_outputs,
                schedule = AveragedTimeInterval(model_year, window = model_year),
                filename = "double_gyre_yearly_mean",
-               overwrite_existing = true)
+               overwrite_existing = !restarting)
 
-run!(simulation)
+run!(simulation; pickup)
 
 
 # # A neat movie
