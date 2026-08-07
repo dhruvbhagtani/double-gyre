@@ -33,3 +33,7 @@ JuliaLocalPreferences.toml
 *.jpg
 *.mp4
 *.png
+
+# Scheduler logs stay under logs/ and are generated per Slurm job.
+logs/*.out
+logs/*.err
