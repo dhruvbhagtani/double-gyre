@@ -30,7 +30,8 @@ const coastal_depth = 500meters # minimum water depth at every lateral boundary 
 # timestep and final time
 Δt = 30minutes # adjust depending on chosen resolution; 30min seems OK with 1/4 deg resolution + RK3 timestep
 model_year = 365days
-stop_time = model_year
+model_month = model_year / 12
+stop_time = 1 * model_year
 
 # resolution
 resolution = 4 # corresponds to 1/resolution in degrees
@@ -574,6 +575,9 @@ end
 simulation.callbacks[:progress] = Callback(progress, TimeInterval(7days))
 
 # ## Output
+
+include(joinpath(@__DIR__, "vorticity_budget_diagnostics.jl"))
+
 u, v, w = model.velocities
 b = model.tracers.b
 
@@ -617,6 +621,42 @@ simulation.output_writers[:yearly_means] =
     JLD2Writer(model, yearly_outputs,
                schedule = AveragedTimeInterval(model_year, window = model_year),
                filename = "double_gyre_yearly_mean",
+               overwrite_existing = true)
+
+discrete_transport_budget = discrete_barotropic_transport_budget(model, parameters)
+
+# Capture the stage-2 physical tendencies that construct the final RK-stage
+# slow forcing. The diagnostic then evaluates the exact transport increment
+# after each full time step and, because it is registered before writer
+# initialization, before the monthly WindowedTimeAverage diagnostics sample
+# the budget fields.
+simulation.callbacks[:capture_stage_two_transport_budget] =
+    Callback(capture_stage_two_budget!, IterationInterval(1);
+             parameters = discrete_transport_budget,
+             callsite = Oceananigans.TendencyCallsite())
+
+simulation.diagnostics[:update_discrete_transport_budget] =
+    DiscreteTransportBudgetDiagnostic(discrete_transport_budget,
+                                      IterationInterval(1))
+
+budget_outputs = discrete_transport_budget.outputs
+
+simulation.output_writers[:barotropic_budget] =
+    JLD2Writer(model, budget_outputs,
+               schedule = AveragedTimeInterval(model_month,
+                                               window = model_month,
+                                               stride = 1),
+               filename = "double_gyre_barotropic_budget",
+               array_type = Array{Float64},
+               overwrite_existing = true)
+
+budget_state_outputs = barotropic_budget_state_outputs(model)
+
+simulation.output_writers[:barotropic_budget_state] =
+    JLD2Writer(model, budget_state_outputs,
+               schedule = TimeInterval(model_month),
+               filename = "double_gyre_barotropic_budget_state",
+               array_type = Array{Float64},
                overwrite_existing = true)
 
 run!(simulation)
