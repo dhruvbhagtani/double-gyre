@@ -395,7 +395,23 @@ simulation.output_writers[:monthly_means] =
                filename = "double_gyre_monthly_mean",
                overwrite_existing = true)
 
-budget_outputs = barotropic_budget_outputs(model, parameters)
+discrete_transport_budget = discrete_barotropic_transport_budget(model, parameters)
+
+# Capture the stage-2 physical tendencies that construct the final RK-stage
+# slow forcing. The diagnostic then evaluates the exact transport increment
+# after each full time step and, because it is registered before writer
+# initialization, before the monthly WindowedTimeAverage diagnostics sample
+# the budget fields.
+simulation.callbacks[:capture_stage_two_transport_budget] =
+    Callback(capture_stage_two_budget!, IterationInterval(1);
+             parameters = discrete_transport_budget,
+             callsite = Oceananigans.TendencyCallsite())
+
+simulation.diagnostics[:update_discrete_transport_budget] =
+    DiscreteTransportBudgetDiagnostic(discrete_transport_budget,
+                                      IterationInterval(1))
+
+budget_outputs = discrete_transport_budget.outputs
 
 simulation.output_writers[:barotropic_budget] =
     JLD2Writer(model, budget_outputs,
