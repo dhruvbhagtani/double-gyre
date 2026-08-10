@@ -127,13 +127,18 @@ When the state file is present, the output also includes `beta_V`,
 vorticity budget of Khatri et al. (2024, JAMES, Eq. 3/A17):
 
 ```text
-beta_V = bottom_pressure_torque + wind_stress - bottom_drag + advection + closure
-         - eta_tendency_term - total
+beta_V = bottom_pressure_torque + wind_stress + bottom_drag + advection + closure
+         + immersed_stress_remainder + slow_decomposition_residual
+         + eta_tendency_term - transport_vorticity_tendency
 ```
 
-`bottom_pressure_torque` (J(pb,H)/ρo) is diagnosed from the Eq. B4 combination
-`coriolis + pressure + beta_V - eta_tendency_term` rather than a raw curl,
-since the paper shows the raw Coriolis and pressure curls are individually
-dominated by C-grid numerical noise. This assumes zero surface mass flux
-(Qm = 0), which holds for this closed-basin, no-flux configuration.
+All stress terms above are already signed momentum tendencies, so
+`bottom_drag` is added. `bottom_pressure_torque` (J(pb,H)/ρo) is diagnosed from
+the Eq. B4 combination
+`coriolis + pressure + split_explicit_pressure + beta_V - eta_tendency_term`
+rather than a raw curl. The split-explicit term is the effective external-mode
+pressure torque applied during the fast free-surface subcycles. The immersed
+stress remainder and slow decomposition residual complete the signed tendency
+used by the solver. This assumes zero surface mass flux (Qm = 0), which holds
+for this closed-basin, no-flux configuration.
 
