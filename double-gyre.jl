@@ -735,7 +735,7 @@ simulation.output_writers[:barotropic_budget] =
                                                stride = 1),
                filename = joinpath(OUTPUT_DIR, "double_gyre_barotropic_budget"),
                array_type = Array{Float64},
-               overwrite_existing = true)
+               overwrite_existing = !restarting)
 
 budget_state_outputs = barotropic_budget_state_outputs(model)
 
@@ -744,7 +744,7 @@ simulation.output_writers[:barotropic_budget_state] =
                schedule = TimeInterval(model_month),
                filename = joinpath(OUTPUT_DIR, "double_gyre_barotropic_budget_state"),
                array_type = Array{Float64},
-               overwrite_existing = true)
+               overwrite_existing = !restarting)
 
 run!(simulation; pickup)
 
