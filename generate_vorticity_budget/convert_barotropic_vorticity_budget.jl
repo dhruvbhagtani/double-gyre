@@ -49,11 +49,17 @@ barotropic vorticity budget of Khatri et al. (2024, JAMES, Eq. 3/A17):
 vorticity point times V). Following their Appendix B2, the raw curls of the
 Coriolis and pressure-gradient terms are individually corrupted by C-grid
 numerical noise, so `bottom_pressure_torque` (J(pb,H)/ρo) is instead diagnosed
-as the Eq. B4 combination
+as the Eq. B4 combination. For a split-explicit free surface, the total pressure
+torque must include the effective external-mode pressure contribution applied
+during the fast subcycles:
 
-    bottom_pressure_torque = coriolis + pressure + beta_V - eta_tendency_term
+    bottom_pressure_torque = coriolis + pressure + split_explicit_pressure
+                             + beta_V - eta_tendency_term
 
-assuming Qm = 0 (this model has no surface mass flux).
+The Khatri closure term also includes `immersed_stress_remainder` and
+`slow_decomposition_residual`, which are required to reproduce the exact signed
+momentum tendency used by the solver. This assumes Qm = 0 (this model has no
+surface mass flux).
 """
 
 using Oceananigans
@@ -427,18 +433,25 @@ function main()
                         file["coriolis"]
                 end
                 is_spherical_coriolis = coriolis isa HydrostaticSphericalCoriolis
+                first_record_curls = first(values(curls_by_iteration))
+                has_khatri_solver_terms = all(haskey(first_record_curls, term)
+                                              for term in (:split_explicit_pressure,
+                                                           :slow_decomposition_residual))
+                can_compute_khatri_budget = is_spherical_coriolis && has_khatri_solver_terms
 
-                if is_spherical_coriolis
+                if can_compute_khatri_budget
                     write_description!(output, "beta_V", "β (Khatri et al. 2024 Eq. 3) times the vertically integrated meridional transport, interpolated to the vorticity point")
                     write_description!(output, "eta_tendency_term", "f ∂tη, the free-surface tendency term in Khatri et al. (2024) Eq. 3")
-                    write_description!(output, "bottom_pressure_torque", "J(pb,H)/ρo, diagnosed as coriolis + pressure + beta_V - eta_tendency_term following Khatri et al. (2024) Eq. B4; assumes Qm=0")
-                    write_description!(output, "khatri_budget_residual", "beta_V - (bottom_pressure_torque + wind_stress + bottom_drag + advection + closure + eta_tendency_term - transport_vorticity_tendency); validates Khatri et al. (2024) Eq. 3 closure")
+                    write_description!(output, "bottom_pressure_torque", "J(pb,H)/ρo, diagnosed as coriolis + pressure + split_explicit_pressure + beta_V - eta_tendency_term following Khatri et al. (2024) Eq. B4; assumes Qm=0")
+                    write_description!(output, "khatri_budget_residual", "beta_V - (bottom_pressure_torque + wind_stress + bottom_drag + advection + closure + immersed_stress_remainder + slow_decomposition_residual + eta_tendency_term - transport_vorticity_tendency); validates Khatri et al. (2024) Eq. 3 closure with the complete split-explicit solver tendency")
                     install_field_metadata!(output, "beta_V", template_field)
                     install_field_metadata!(output, "eta_tendency_term", template_field)
                     install_field_metadata!(output, "bottom_pressure_torque", template_field)
                     install_field_metadata!(output, "khatri_budget_residual", template_field)
-                else
+                elseif !is_spherical_coriolis
                     @warn "Coriolis is not HydrostaticSphericalCoriolis; skipping Khatri et al. (2024) beta_V/bottom_pressure_torque diagnostics" coriolis=typeof(coriolis)
+                else
+                    @warn "Split-explicit solver diagnostics are incomplete; skipping Khatri et al. (2024) diagnostics rather than writing a non-closing budget" required_terms=(:split_explicit_pressure, :slow_decomposition_residual)
                 end
 
                 for records in record_groups
@@ -449,8 +462,8 @@ function main()
                                                                 state["transport_v"][record]))
                     write_record!(output, "transport_vorticity", iteration, transport_vorticity)
 
-                    beta_V = is_spherical_coriolis ? compute_beta_V(grid, coriolis, state["transport_v"][record]) : nothing
-                    is_spherical_coriolis && write_record!(output, "beta_V", iteration, beta_V)
+                    beta_V = can_compute_khatri_budget ? compute_beta_V(grid, coriolis, state["transport_v"][record]) : nothing
+                    can_compute_khatri_budget && write_record!(output, "beta_V", iteration, beta_V)
 
                     if record == 1
                         # FieldTimeSeries expects every field to have the global
@@ -460,7 +473,7 @@ function main()
                         write_record!(output, "transport_vorticity_tendency", iteration, undefined_tendency)
                         write_record!(output, "tendency_closure_residual", iteration, undefined_tendency)
 
-                        if is_spherical_coriolis
+                        if can_compute_khatri_budget
                             write_record!(output, "eta_tendency_term", iteration, undefined_tendency)
                             write_record!(output, "bottom_pressure_torque", iteration, undefined_tendency)
                             write_record!(output, "khatri_budget_residual", iteration, undefined_tendency)
@@ -475,7 +488,7 @@ function main()
                         write_record!(output, "transport_vorticity_tendency", iteration, tendency)
                         write_record!(output, "tendency_closure_residual", iteration, residual)
 
-                        if is_spherical_coriolis
+                        if can_compute_khatri_budget
                             eta_tendency_term = compute_f_eta_tendency(grid, coriolis,
                                                                        state["free_surface"][record],
                                                                        state["free_surface"][previous_record],
@@ -483,11 +496,16 @@ function main()
                             write_record!(output, "eta_tendency_term", iteration, eta_tendency_term)
 
                             record_curls = curls_by_iteration[iteration]
-                            bottom_pressure_torque = record_curls[:coriolis] .+ record_curls[:pressure] .+ beta_V .- eta_tendency_term
+                            bottom_pressure_torque = (record_curls[:coriolis] .+ record_curls[:pressure] .+
+                                                      record_curls[:split_explicit_pressure] .+ beta_V .-
+                                                      eta_tendency_term)
                             write_record!(output, "bottom_pressure_torque", iteration, bottom_pressure_torque)
 
                             khatri_rhs = (bottom_pressure_torque .+ record_curls[:wind_stress] .+ record_curls[:bottom_drag] .+
-                                         record_curls[:advection] .+ record_curls[:closure] .+ eta_tendency_term .- tendency)
+                                         record_curls[:advection] .+ record_curls[:closure] .+
+                                         record_curls[:immersed_stress_remainder] .+
+                                         record_curls[:slow_decomposition_residual] .+
+                                         eta_tendency_term .- tendency)
                             khatri_budget_residual = beta_V .- khatri_rhs
                             write_record!(output, "khatri_budget_residual", iteration, khatri_budget_residual)
                         end
