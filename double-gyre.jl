@@ -241,7 +241,7 @@ end
 # ## Boundary conditions
 #
 # ### Wind stress
-@inline u_stress(λ, φ, t, p) = p.τ * sin(2π * (φ - p.φ₀) / p.Lφ)
+@inline u_stress(λ, φ, t, p) = -p.τ * cos(2π * (φ - φ_south) / p.Lφ)
 
 # ### Buoyancy relaxation
 @inline surface_buoyancy(φ, p) = p.Δb * (φ - p.φ₀) / p.Lφ
