@@ -199,7 +199,7 @@ parameters = (Lφ = Lφ,
      φ_slope_width = 7.5,        # south/north sidewall width [°]
    coastal_depth = coastal_depth,
       slope_config = slope_config,
-              Δb = ΔT * α * g,   # surface vertical buoyancy gradient [s⁻²]
+              Δb = ΔT * α * g,   # buoyancy contrast magnitude [m s⁻²]
        timescale = buoyancy_restoring_timescale,       # relaxation time scale [s]
               vˢ = Δzₛ / buoyancy_restoring_timescale) # buoyancy pumping velocity [m s⁻¹]
 
@@ -244,7 +244,8 @@ end
 @inline u_stress(λ, φ, t, p) = -p.τ * cos(2π * (φ - φ_south) / p.Lφ)
 
 # ### Buoyancy relaxation
-@inline surface_buoyancy(φ, p) = p.Δb * (φ - p.φ₀) / p.Lφ
+# Colder, denser water in the north and warmer, lighter water in the south.
+@inline surface_buoyancy(φ, p) = -p.Δb * (φ - p.φ₀) / p.Lφ
 @inline function buoyancy_relaxation(i, j, grid, clock, model_fields, p)
     b = @inbounds model_fields.b[i, j, grid.Nz] # surface b
     φ = φnode(j, grid, Center())
